@@ -35,6 +35,15 @@ Filter: TypeAlias = nnx.filterlib.Filter
 
 
 @dataclasses.dataclass(frozen=True)
+class SliceObservationState(_transforms.DataTransformFn):
+    state_dim: int
+
+    def __call__(self, data: dict) -> dict:
+        data["observation/state"] = data["observation/state"][..., : self.state_dim]
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class AssetsConfig:
     """Determines the location of assets (e.g., norm stats) that will be used to set up the data pipeline.
 
@@ -462,16 +471,18 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         )
 
 
-def _flexiv_pump_data_config() -> SimpleDataConfig:
+def _flexiv_pump_data_config(*, include_force: bool = False) -> SimpleDataConfig:
     # The dataset action is [target_eef_pose(6), target_gripper_width(1)].
     # pi0 is trained on delta actions for continuous robot motion, while gripper
     # commands are kept absolute.
     delta_action_mask = _transforms.make_bool_mask(6, -1)
+    state_dim = 13 if include_force else 7
 
     return SimpleDataConfig(
         repo_id="flexiv_pump_1bottle_inputForce",
         data_transforms=lambda model: _transforms.Group(
             inputs=[
+                SliceObservationState(state_dim),
                 libero_policy.LiberoInputs(model_type=model.model_type),
                 _transforms.DeltaActions(delta_action_mask),
             ],
@@ -742,6 +753,21 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=16,
         num_workers=0,
+        checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_flexiv_pump_1bottle_inputForce_lora_with_force",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=_flexiv_pump_data_config(include_force=True),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        batch_size=16,
+        num_workers=0,
+        checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
         freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
@@ -755,6 +781,17 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=16,
         num_workers=0,
+        checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
+    ),
+    TrainConfig(
+        name="pi0_flexiv_pump_1bottle_inputForce_with_force",
+        model=pi0_config.Pi0Config(),
+        data=_flexiv_pump_data_config(include_force=True),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        batch_size=16,
+        num_workers=0,
+        checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
     ),
     TrainConfig(
         name="pi0_fast_libero",
