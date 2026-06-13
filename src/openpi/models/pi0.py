@@ -1,4 +1,5 @@
 import logging
+import math
 
 import einops
 import flax.nnx as nnx
@@ -15,7 +16,7 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
-_LOG_2PI = jnp.log(2.0 * jnp.pi)
+_LOG_2PI = math.log(2.0 * math.pi)
 
 
 def make_attn_mask(input_mask, mask_ar):
