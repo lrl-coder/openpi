@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import numpy as np
 from typing_extensions import override
 import tyro
 
@@ -41,6 +42,79 @@ class SliceObservationState(_transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         data["observation/state"] = data["observation/state"][..., : self.state_dim]
         return data
+
+
+@dataclasses.dataclass(frozen=True)
+class FlexivPumpInputs(_transforms.DataTransformFn):
+    """Converts the Flexiv pump LeRobot sample into pi0 inputs and exposes force labels."""
+
+    model_type: ModelType
+    include_force_in_state: bool = False
+
+    def __call__(self, data: dict) -> dict:
+        raw_state = np.asarray(data["observation/state"])
+        if raw_state.ndim >= 2:
+            current_state = raw_state[0]
+            force_sequence = raw_state[..., 7:13]
+        else:
+            current_state = raw_state
+            force_sequence = None
+
+        if current_state.shape[-1] < 13:
+            raise ValueError(
+                "Flexiv force-guided configs require raw observation/state with 13 dims: "
+                "current_eef_pose(6), gripper_width(1), f_ext_base_frame(6)."
+            )
+
+        state_dim = 13 if self.include_force_in_state else 7
+        model_input = dict(data)
+        model_input["observation/state"] = current_state[:state_dim]
+        inputs = libero_policy.LiberoInputs(model_type=self.model_type)(model_input)
+
+        current_force = current_state[7:13]
+        inputs["force"] = current_force
+
+        if force_sequence is not None and "actions" in inputs:
+            force_targets = force_sequence[1:]
+            action_horizon = inputs["actions"].shape[0]
+            if force_targets.shape[0] == 0:
+                force_targets = np.repeat(current_force[None, :], action_horizon, axis=0)
+            elif force_targets.shape[0] < action_horizon:
+                pad_count = action_horizon - force_targets.shape[0]
+                force_targets = np.concatenate(
+                    [force_targets, np.repeat(force_targets[-1:], pad_count, axis=0)],
+                    axis=0,
+                )
+            elif force_targets.shape[0] > action_horizon:
+                force_targets = force_targets[:action_horizon]
+
+            inputs["force_targets"] = force_targets
+            inputs["force_task_target"] = np.mean(force_targets, axis=0)
+        else:
+            inputs["force_task_target"] = current_force
+
+        return inputs
+
+
+def _force_norm_stats_from_state(
+    norm_stats: dict[str, _transforms.NormStats] | None,
+) -> dict[str, _transforms.NormStats] | None:
+    if norm_stats is None or "state" not in norm_stats:
+        return norm_stats
+
+    state_stats = norm_stats["state"]
+    force_stats = _normalize.NormStats(
+        mean=np.asarray(state_stats.mean)[7:13],
+        std=np.asarray(state_stats.std)[7:13],
+        q01=None if state_stats.q01 is None else np.asarray(state_stats.q01)[7:13],
+        q99=None if state_stats.q99 is None else np.asarray(state_stats.q99)[7:13],
+    )
+    return {
+        **norm_stats,
+        "force": force_stats,
+        "force_targets": force_stats,
+        "force_task_target": force_stats,
+    }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,6 +169,10 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+    # Optional extra LeRobot keys that should be loaded as delta-timestamp sequences. Values are integer frame offsets.
+    extra_delta_timestamp_steps: dict[str, Sequence[int]] = dataclasses.field(default_factory=dict)
+    # If true, derive force normalization stats from state[7:13].
+    derive_force_norm_stats_from_state: bool = False
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -188,11 +266,14 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
+        norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
+        if self.base_config and self.base_config.derive_force_norm_stats_from_state:
+            norm_stats = _force_norm_stats_from_state(norm_stats)
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            norm_stats=norm_stats,
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
@@ -471,7 +552,12 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         )
 
 
-def _flexiv_pump_data_config(*, include_force: bool = False) -> SimpleDataConfig:
+def _flexiv_pump_data_config(
+    *,
+    include_force: bool = False,
+    force_guided: bool = False,
+    assets_dir: str | None = None,
+) -> SimpleDataConfig:
     # The dataset action is [target_eef_pose(6), target_gripper_width(1)].
     # pi0 is trained on delta actions for continuous robot motion, while gripper
     # commands are kept absolute.
@@ -480,10 +566,16 @@ def _flexiv_pump_data_config(*, include_force: bool = False) -> SimpleDataConfig
 
     return SimpleDataConfig(
         repo_id="flexiv_pump_1bottle_inputForce",
+        assets=AssetsConfig(
+            assets_dir=assets_dir,
+            asset_id="flexiv_pump_1bottle_inputForce" if assets_dir is not None else None,
+        ),
         data_transforms=lambda model: _transforms.Group(
             inputs=[
-                SliceObservationState(state_dim),
-                libero_policy.LiberoInputs(model_type=model.model_type),
+                FlexivPumpInputs(model_type=model.model_type, include_force_in_state=include_force)
+                if force_guided
+                else SliceObservationState(state_dim),
+                *([] if force_guided else [libero_policy.LiberoInputs(model_type=model.model_type)]),
                 _transforms.DeltaActions(delta_action_mask),
             ],
             outputs=[
@@ -494,6 +586,8 @@ def _flexiv_pump_data_config(*, include_force: bool = False) -> SimpleDataConfig
         base_config=DataConfig(
             prompt_from_task=True,
             action_sequence_keys=("action",),
+            extra_delta_timestamp_steps={"observation.state": tuple(range(51))} if force_guided else {},
+            derive_force_norm_stats_from_state=force_guided,
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(
@@ -774,6 +868,63 @@ _CONFIGS = [
         ema_decay=None,
     ),
     TrainConfig(
+        name="pi0_flexiv_pump_1bottle_inputForce_lora_force_guided",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_guidance=True,
+            force_loss_weight=0.05,
+            force_target_loss_weight=0.01,
+            force_guidance_lambda_max=0.2,
+            force_guidance_k=1.0,
+            force_guidance_tau0=6.0,
+        ),
+        data=_flexiv_pump_data_config(
+            force_guided=True,
+            assets_dir="./assets/pi0_flexiv_pump_1bottle_inputForce_lora",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        batch_size=16,
+        num_workers=0,
+        checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_guidance=True,
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_flexiv_pump_1bottle_inputForce_lora_with_force_guided",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_guidance=True,
+            force_loss_weight=0.05,
+            force_target_loss_weight=0.01,
+            force_guidance_lambda_max=0.2,
+            force_guidance_k=1.0,
+            force_guidance_tau0=6.0,
+        ),
+        data=_flexiv_pump_data_config(
+            include_force=True,
+            force_guided=True,
+            assets_dir="./assets/pi0_flexiv_pump_1bottle_inputForce_lora_with_force",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        batch_size=16,
+        num_workers=0,
+        checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_guidance=True,
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
         name="pi0_flexiv_pump_1bottle_inputForce",
         model=pi0_config.Pi0Config(),
         data=_flexiv_pump_data_config(),
@@ -787,6 +938,47 @@ _CONFIGS = [
         name="pi0_flexiv_pump_1bottle_inputForce_with_force",
         model=pi0_config.Pi0Config(),
         data=_flexiv_pump_data_config(include_force=True),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        batch_size=16,
+        num_workers=0,
+        checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
+    ),
+    TrainConfig(
+        name="pi0_flexiv_pump_1bottle_inputForce_force_guided",
+        model=pi0_config.Pi0Config(
+            force_guidance=True,
+            force_loss_weight=0.05,
+            force_target_loss_weight=0.01,
+            force_guidance_lambda_max=0.2,
+            force_guidance_k=1.0,
+            force_guidance_tau0=6.0,
+        ),
+        data=_flexiv_pump_data_config(
+            force_guided=True,
+            assets_dir="./assets/pi0_flexiv_pump_1bottle_inputForce",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        batch_size=16,
+        num_workers=0,
+        checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
+    ),
+    TrainConfig(
+        name="pi0_flexiv_pump_1bottle_inputForce_with_force_guided",
+        model=pi0_config.Pi0Config(
+            force_guidance=True,
+            force_loss_weight=0.05,
+            force_target_loss_weight=0.01,
+            force_guidance_lambda_max=0.2,
+            force_guidance_k=1.0,
+            force_guidance_tau0=6.0,
+        ),
+        data=_flexiv_pump_data_config(
+            include_force=True,
+            force_guided=True,
+            assets_dir="./assets/pi0_flexiv_pump_1bottle_inputForce_with_force",
+        ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
         batch_size=16,

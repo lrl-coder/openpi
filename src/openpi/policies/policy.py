@@ -50,22 +50,35 @@ class Policy(BasePolicy):
         self._model = model
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
-        self._sample_kwargs = sample_kwargs or {}
+        self._sample_kwargs = dict(sample_kwargs or {})
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self._force_guidance_enabled = bool(self._sample_kwargs.pop("force_guidance_from_cst", False))
+        self._prev_force_mu = None
+        self._prev_force_log_sigma = None
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
+            self._predict_force = None
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            self._predict_force = (
+                nnx_utils.module_jit(model.predict_force)
+                if self._force_guidance_enabled and hasattr(model, "predict_force")
+                else None
+            )
             self._rng = rng or jax.random.key(0)
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        if bool(np.asarray(obs.get("reset", False))):
+            self._prev_force_mu = None
+            self._prev_force_log_sigma = None
+
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -80,6 +93,15 @@ class Policy(BasePolicy):
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        if self._force_guidance_enabled and not self._is_pytorch_model and self._prev_force_mu is not None:
+            force = inputs.get("force")
+            if force is not None:
+                force = jnp.asarray(force)
+                prev_mu = jnp.asarray(self._prev_force_mu)
+                prev_log_sigma = jnp.asarray(self._prev_force_log_sigma)
+                inv_var = jnp.exp(-2.0 * prev_log_sigma)
+                sample_kwargs["cst_tau"] = jnp.sum(jnp.square(force - prev_mu) * inv_var, axis=-1)
+
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
@@ -93,6 +115,10 @@ class Policy(BasePolicy):
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
+        if self._force_guidance_enabled and self._predict_force is not None:
+            force_mu, force_log_sigma = self._predict_force(observation, outputs["actions"])
+            self._prev_force_mu = force_mu[:, 0, :]
+            self._prev_force_log_sigma = force_log_sigma[:, 0, :]
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)

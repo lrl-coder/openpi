@@ -15,6 +15,8 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
+_LOG_2PI = jnp.log(2.0 * jnp.pi)
+
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -67,6 +69,13 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.force_guidance = config.force_guidance
+        self.force_dim = config.force_dim
+        self.force_loss_weight = config.force_loss_weight
+        self.force_target_loss_weight = config.force_target_loss_weight
+        self.force_guidance_lambda_max = config.force_guidance_lambda_max
+        self.force_guidance_k = config.force_guidance_k
+        self.force_guidance_tau0 = config.force_guidance_tau0
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -99,8 +108,70 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        if self.force_guidance:
+            force_predictor_input_dim = (
+                config.action_dim + config.action_dim + config.force_dim + paligemma_config.width
+            )
+            self.force_predictor_in = nnx.Linear(force_predictor_input_dim, action_expert_config.width, rngs=rngs)
+            self.force_predictor_out = nnx.Linear(action_expert_config.width, 2 * config.force_dim, rngs=rngs)
+            self.force_target_in = nnx.Linear(paligemma_config.width, action_expert_config.width, rngs=rngs)
+            self.force_target_out = nnx.Linear(action_expert_config.width, 2 * config.force_dim, rngs=rngs)
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
+
+    def _pool_prefix(self, prefix_out, prefix_mask):
+        mask = prefix_mask.astype(prefix_out.dtype)[..., None]
+        denom = jnp.maximum(jnp.sum(mask, axis=1), 1.0)
+        return jnp.sum(prefix_out * mask, axis=1) / denom
+
+    def _split_force_distribution(self, x):
+        mu, log_sigma = jnp.split(x.astype(jnp.float32), 2, axis=-1)
+        return mu, jnp.clip(log_sigma, -5.0, 3.0)
+
+    def _predict_force_target(self, prefix_pooled):
+        hidden = self.force_target_in(prefix_pooled)
+        hidden = nnx.swish(hidden)
+        return self._split_force_distribution(self.force_target_out(hidden))
+
+    def _predict_force(self, clean_actions, obs: _model.Observation, prefix_pooled):
+        batch_size, horizon = clean_actions.shape[:2]
+        force = obs.force
+        if force is None:
+            force = jnp.zeros((batch_size, self.force_dim), dtype=clean_actions.dtype)
+        else:
+            force = force.astype(clean_actions.dtype)
+
+        state_tokens = einops.repeat(obs.state.astype(clean_actions.dtype), "b d -> b h d", h=horizon)
+        force_tokens = einops.repeat(force, "b d -> b h d", h=horizon)
+        prefix_tokens = einops.repeat(prefix_pooled.astype(clean_actions.dtype), "b d -> b h d", h=horizon)
+        inputs = jnp.concatenate([clean_actions, state_tokens, force_tokens, prefix_tokens], axis=-1)
+
+        hidden = self.force_predictor_in(inputs)
+        hidden = nnx.swish(hidden)
+        return self._split_force_distribution(self.force_predictor_out(hidden))
+
+    def _diag_gaussian_nll(self, target, mu, log_sigma):
+        log_sigma = jnp.clip(log_sigma, -5.0, 3.0)
+        inv_var = jnp.exp(-2.0 * log_sigma)
+        nll = 0.5 * (jnp.square(target.astype(jnp.float32) - mu) * inv_var + 2.0 * log_sigma + _LOG_2PI)
+        return jnp.mean(nll, axis=-1)
+
+    def predict_force(
+        self,
+        observation: _model.Observation,
+        actions: _model.Actions,
+    ) -> tuple[at.Float[at.Array, "b ah f"], at.Float[at.Array, "b ah f"]]:
+        if not self.force_guidance:
+            raise ValueError("predict_force is only available when force_guidance=True.")
+
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), _ = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        prefix_pooled = self._pool_prefix(prefix_out, prefix_mask)
+        return self._predict_force(actions, observation, prefix_pooled)
 
     @at.typecheck
     def embed_prefix(
@@ -211,7 +282,24 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+
+        if not self.force_guidance:
+            return loss
+
+        prefix_pooled = self._pool_prefix(prefix_out, prefix_mask)
+
+        if self.force_loss_weight > 0.0 and observation.force_targets is not None:
+            force_mu, force_log_sigma = self._predict_force(actions, observation, prefix_pooled)
+            force_loss = self._diag_gaussian_nll(observation.force_targets, force_mu, force_log_sigma)
+            loss = loss + self.force_loss_weight * force_loss
+
+        if self.force_target_loss_weight > 0.0 and observation.force_task_target is not None:
+            target_mu, target_log_sigma = self._predict_force_target(prefix_pooled)
+            target_loss = self._diag_gaussian_nll(observation.force_task_target, target_mu, target_log_sigma)
+            loss = loss + self.force_target_loss_weight * target_loss[:, None]
+
+        return loss
 
     @override
     def sample_actions(
@@ -221,6 +309,10 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        cst_tau: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
+        force_guidance_lambda: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
+        force_target_mu: at.Float[at.Array, "b f"] | None = None,
+        force_target_log_sigma: at.Float[at.Array, "b f"] | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -234,7 +326,36 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        (cached_prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+
+        enable_force_guidance = self.force_guidance and (
+            cst_tau is not None or force_guidance_lambda is not None
+        )
+        if enable_force_guidance:
+            prefix_pooled = self._pool_prefix(cached_prefix_out, prefix_mask)
+            if force_target_mu is None or force_target_log_sigma is None:
+                predicted_target_mu, predicted_target_log_sigma = self._predict_force_target(prefix_pooled)
+                if force_target_mu is None:
+                    force_target_mu = predicted_target_mu
+                if force_target_log_sigma is None:
+                    force_target_log_sigma = predicted_target_log_sigma
+        else:
+            prefix_pooled = None
+
+        if enable_force_guidance:
+            if force_guidance_lambda is None:
+                cst_tau = jnp.asarray(cst_tau, dtype=jnp.float32)
+                if cst_tau.ndim == 0:
+                    cst_tau = jnp.broadcast_to(cst_tau, (batch_size,))
+                force_guidance_lambda = self.force_guidance_lambda_max * jax.nn.sigmoid(
+                    self.force_guidance_k * (cst_tau - self.force_guidance_tau0)
+                )
+            else:
+                force_guidance_lambda = jnp.asarray(force_guidance_lambda, dtype=jnp.float32)
+                if force_guidance_lambda.ndim == 0:
+                    force_guidance_lambda = jnp.broadcast_to(force_guidance_lambda, (batch_size,))
 
         def step(carry):
             x_t, time = carry
@@ -258,15 +379,36 @@ class Pi0(_model.BaseModel):
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            (step_prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
                 mask=full_attn_mask,
                 positions=positions,
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
             )
-            assert prefix_out is None
+            assert step_prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+            if enable_force_guidance:
+                assert prefix_pooled is not None
+                assert force_target_mu is not None
+                assert force_target_log_sigma is not None
+                base_v_t = jax.lax.stop_gradient(v_t)
+
+                def guidance_nll(action_sample):
+                    clean_action_estimate = action_sample - time * base_v_t
+                    force_mu, _ = self._predict_force(clean_action_estimate, observation, prefix_pooled)
+                    nll = self._diag_gaussian_nll(
+                        force_target_mu[:, None, :],
+                        force_mu,
+                        force_target_log_sigma[:, None, :],
+                    )
+                    return jnp.sum(nll * force_guidance_lambda[:, None])
+
+                guidance_grad = jax.grad(guidance_nll)(x_t)
+                # The sampler integrates from t=1 to t=0 with negative dt, while v_t predicts noise - action.
+                # Adding grad(NLL) to this velocity moves the clean-action estimate down the NLL gradient.
+                v_t = v_t + guidance_grad
 
             return x_t + dt * v_t, time + dt
 

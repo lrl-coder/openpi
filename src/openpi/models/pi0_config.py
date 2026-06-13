@@ -34,6 +34,15 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = "max-autotune"
 
+    # Force-aware pi0 extensions. Disabled by default to keep the released pi0 behavior unchanged.
+    force_guidance: bool = False
+    force_dim: int = 6
+    force_loss_weight: float = 0.0
+    force_target_loss_weight: float = 0.0
+    force_guidance_lambda_max: float = 0.0
+    force_guidance_k: float = 1.0
+    force_guidance_tau0: float = 6.0
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -80,6 +89,21 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                force=(
+                    jax.ShapeDtypeStruct([batch_size, self.force_dim], jnp.float32)
+                    if self.force_guidance
+                    else None
+                ),
+                force_targets=(
+                    jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.force_dim], jnp.float32)
+                    if self.force_guidance
+                    else None
+                ),
+                force_task_target=(
+                    jax.ShapeDtypeStruct([batch_size, self.force_dim], jnp.float32)
+                    if self.force_guidance
+                    else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

@@ -72,6 +72,10 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    output_norm_stats = None
+    if norm_stats is not None:
+        output_norm_stats = {key: value for key, value in norm_stats.items() if key in {"state", "actions"}}
+
     return _policy.Policy(
         model,
         transforms=[
@@ -83,7 +87,7 @@ def create_trained_policy(
         ],
         output_transforms=[
             *data_config.model_transforms.outputs,
-            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            transforms.Unnormalize(output_norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.data_transforms.outputs,
             *repack_transforms.outputs,
         ],
