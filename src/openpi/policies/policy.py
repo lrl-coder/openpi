@@ -58,10 +58,15 @@ class Policy(BasePolicy):
         self._force_model_enabled = bool(getattr(model, "force_guidance", False))
         self._prev_force_mu = None
         self._prev_force_log_sigma = None
-        self._force_history = None
-        self._force_history_len = int(getattr(getattr(model, "config", None), "force_history_len", 16))
-        if hasattr(model, "force_history_len"):
-            self._force_history_len = int(model.force_history_len)
+        self._force_history_global = None
+        self._force_history_local = None
+        model_config = getattr(model, "config", None)
+        self._force_history_global_len = int(getattr(model_config, "force_history_global_len", 64))
+        self._force_history_local_len = int(getattr(model_config, "force_history_local_len", 16))
+        if hasattr(model, "force_history_global_len"):
+            self._force_history_global_len = int(model.force_history_global_len)
+        if hasattr(model, "force_history_local_len"):
+            self._force_history_local_len = int(model.force_history_local_len)
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -83,18 +88,31 @@ class Policy(BasePolicy):
         if bool(np.asarray(obs.get("reset", False))):
             self._prev_force_mu = None
             self._prev_force_log_sigma = None
-            self._force_history = None
+            self._force_history_global = None
+            self._force_history_local = None
 
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
         if self._force_model_enabled and not self._is_pytorch_model and "force" in inputs:
             current_force = np.asarray(inputs["force"])
-            if self._force_history is None:
-                self._force_history = np.repeat(current_force[None, :], self._force_history_len, axis=0)
+            if self._force_history_global is None:
+                self._force_history_global = np.repeat(
+                    current_force[None, :], self._force_history_global_len, axis=0
+                )
+                self._force_history_local = np.repeat(
+                    current_force[None, :], self._force_history_local_len, axis=0
+                )
             else:
-                self._force_history = np.concatenate([self._force_history[1:], current_force[None, :]], axis=0)
-            inputs["force_history"] = self._force_history
+                self._force_history_global = np.concatenate(
+                    [self._force_history_global[1:], current_force[None, :]], axis=0
+                )
+                self._force_history_local = np.concatenate(
+                    [self._force_history_local[1:], current_force[None, :]], axis=0
+                )
+            inputs["force_history_global"] = self._force_history_global
+            inputs["force_history_local"] = self._force_history_local
+            inputs["force_history"] = self._force_history_local
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)

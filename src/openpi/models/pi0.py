@@ -72,8 +72,9 @@ class Pi0(_model.BaseModel):
         self.pi05 = config.pi05
         self.force_guidance = config.force_guidance
         self.force_dim = config.force_dim
-        self.force_history_len = config.force_history_len
-        self.force_slow_patch_size = config.force_slow_patch_size
+        self.force_history_global_len = config.force_history_global_len
+        self.force_history_local_len = config.force_history_local_len
+        self.force_global_patch_size = config.force_global_patch_size
         self.force_loss_weight = config.force_loss_weight
         self.force_target_loss_weight = config.force_target_loss_weight
         self.force_guidance_lambda_max = config.force_guidance_lambda_max
@@ -119,20 +120,20 @@ class Pi0(_model.BaseModel):
             )
             self.force_predictor_in = nnx.Linear(force_predictor_input_dim, action_expert_config.width, rngs=rngs)
             self.force_predictor_out = nnx.Linear(action_expert_config.width, 2 * config.force_dim, rngs=rngs)
-            force_slow_patch_dim = config.force_slow_patch_size * config.force_dim
-            self.force_slow_patch_proj = nnx.Linear(force_slow_patch_dim, paligemma_config.width, rngs=rngs)
-            self.force_slow_pos_embedding = nnx.Param(
-                jnp.zeros((self.force_num_slow_tokens, paligemma_config.width), dtype=jnp.float32)
+            force_global_patch_dim = self.force_global_patch_size * config.force_dim
+            self.force_global_patch_proj = nnx.Linear(force_global_patch_dim, paligemma_config.width, rngs=rngs)
+            self.force_global_pos_embedding = nnx.Param(
+                jnp.zeros((self.force_num_global_tokens, paligemma_config.width), dtype=jnp.float32)
             )
-            self.force_fast_conv1 = nnx.Conv(
+            self.force_local_conv1 = nnx.Conv(
                 config.force_dim, 64, kernel_size=3, padding="CAUSAL", rngs=rngs
             )
-            self.force_fast_norm1 = nnx.LayerNorm(64, rngs=rngs)
-            self.force_fast_conv2 = nnx.Conv(
+            self.force_local_norm1 = nnx.LayerNorm(64, rngs=rngs)
+            self.force_local_conv2 = nnx.Conv(
                 64, 128, kernel_size=3, padding="CAUSAL", kernel_dilation=2, rngs=rngs
             )
-            self.force_fast_norm2 = nnx.LayerNorm(128, rngs=rngs)
-            self.force_fast_conv3 = nnx.Conv(
+            self.force_local_norm2 = nnx.LayerNorm(128, rngs=rngs)
+            self.force_local_conv3 = nnx.Conv(
                 128,
                 action_expert_config.width,
                 kernel_size=3,
@@ -140,8 +141,8 @@ class Pi0(_model.BaseModel):
                 kernel_dilation=4,
                 rngs=rngs,
             )
-            self.force_fast_norm3 = nnx.LayerNorm(action_expert_config.width, rngs=rngs)
-            self.force_fast_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            self.force_local_norm3 = nnx.LayerNorm(action_expert_config.width, rngs=rngs)
+            self.force_local_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.force_target_in = nnx.Linear(paligemma_config.width, action_expert_config.width, rngs=rngs)
             self.force_target_out = nnx.Linear(action_expert_config.width, 2 * config.force_dim, rngs=rngs)
 
@@ -149,59 +150,70 @@ class Pi0(_model.BaseModel):
         self.deterministic = True
 
     @property
-    def force_num_slow_tokens(self) -> int:
-        return math.ceil(self.force_history_len / self.force_slow_patch_size)
+    def force_num_global_tokens(self) -> int:
+        return math.ceil(self.force_history_global_len / self.force_global_patch_size)
 
     def _pool_prefix(self, prefix_out, prefix_mask):
         mask = prefix_mask.astype(prefix_out.dtype)[..., None]
         denom = jnp.maximum(jnp.sum(mask, axis=1), 1.0)
         return jnp.sum(prefix_out * mask, axis=1) / denom
 
-    def _force_history_or_current(self, obs: _model.Observation, dtype):
+    def _force_history_or_current(self, obs: _model.Observation, dtype, *, scope: str):
         batch_size = obs.state.shape[0]
-        if obs.force_history is not None:
+        if scope == "global":
+            target_len = self.force_history_global_len
+            preferred_history = obs.force_history_global
+        elif scope == "local":
+            target_len = self.force_history_local_len
+            preferred_history = obs.force_history_local
+        else:
+            raise ValueError(f"Unknown force history scope: {scope}")
+
+        if preferred_history is not None:
+            force_history = preferred_history.astype(dtype)
+        elif obs.force_history is not None:
             force_history = obs.force_history.astype(dtype)
         elif obs.force is not None:
-            force_history = einops.repeat(obs.force.astype(dtype), "b f -> b h f", h=self.force_history_len)
+            force_history = einops.repeat(obs.force.astype(dtype), "b f -> b h f", h=target_len)
         else:
-            force_history = jnp.zeros((batch_size, self.force_history_len, self.force_dim), dtype=dtype)
+            force_history = jnp.zeros((batch_size, target_len, self.force_dim), dtype=dtype)
 
         history_len = force_history.shape[1]
-        if history_len < self.force_history_len:
-            pad = jnp.repeat(force_history[:, :1, :], self.force_history_len - history_len, axis=1)
+        if history_len < target_len:
+            pad = jnp.repeat(force_history[:, :1, :], target_len - history_len, axis=1)
             force_history = jnp.concatenate([pad, force_history], axis=1)
-        elif history_len > self.force_history_len:
-            force_history = force_history[:, -self.force_history_len :, :]
+        elif history_len > target_len:
+            force_history = force_history[:, -target_len:, :]
         return force_history
 
-    def _embed_force_slow_tokens(self, obs: _model.Observation, dtype):
-        force_history = self._force_history_or_current(obs, dtype)
-        pad_len = self.force_num_slow_tokens * self.force_slow_patch_size - self.force_history_len
+    def _embed_force_global_tokens(self, obs: _model.Observation, dtype):
+        force_history = self._force_history_or_current(obs, dtype, scope="global")
+        pad_len = self.force_num_global_tokens * self.force_global_patch_size - self.force_history_global_len
         if pad_len > 0:
             force_history = jnp.pad(force_history, ((0, 0), (pad_len, 0), (0, 0)))
         patches = einops.rearrange(
             force_history,
             "b (n p) f -> b n (p f)",
-            n=self.force_num_slow_tokens,
-            p=self.force_slow_patch_size,
+            n=self.force_num_global_tokens,
+            p=self.force_global_patch_size,
         )
-        tokens = self.force_slow_patch_proj(patches)
-        pos = self.force_slow_pos_embedding.value.astype(tokens.dtype)
+        tokens = self.force_global_patch_proj(patches)
+        pos = self.force_global_pos_embedding.value.astype(tokens.dtype)
         return tokens + pos[None, :, :]
 
-    def _embed_force_fast_token(self, obs: _model.Observation, dtype):
-        force_history = self._force_history_or_current(obs, dtype)
-        hidden = self.force_fast_conv1(force_history)
-        hidden = self.force_fast_norm1(hidden)
+    def _embed_force_local_token(self, obs: _model.Observation, dtype):
+        force_history = self._force_history_or_current(obs, dtype, scope="local")
+        hidden = self.force_local_conv1(force_history)
+        hidden = self.force_local_norm1(hidden)
         hidden = nnx.swish(hidden)
-        hidden = self.force_fast_conv2(hidden)
-        hidden = self.force_fast_norm2(hidden)
+        hidden = self.force_local_conv2(hidden)
+        hidden = self.force_local_norm2(hidden)
         hidden = nnx.swish(hidden)
-        hidden = self.force_fast_conv3(hidden)
-        hidden = self.force_fast_norm3(hidden)
+        hidden = self.force_local_conv3(hidden)
+        hidden = self.force_local_norm3(hidden)
         hidden = nnx.swish(hidden)
         pooled = jnp.mean(hidden, axis=1)
-        pooled = self.force_fast_out(pooled)
+        pooled = self.force_local_out(pooled)
         pooled = nnx.swish(pooled)
         return pooled[:, None, :]
 
@@ -343,10 +355,10 @@ class Pi0(_model.BaseModel):
         ar_mask = []
         tokens = []
         if self.force_guidance:
-            force_tokens = self._embed_force_slow_tokens(obs, next(iter(obs.images.values())).dtype)
+            force_tokens = self._embed_force_global_tokens(obs, next(iter(obs.images.values())).dtype)
             tokens.append(force_tokens)
             input_mask.append(jnp.ones(force_tokens.shape[:2], dtype=jnp.bool_))
-            # Force history tokens are observed context and can attend bidirectionally with image/language prefix tokens.
+            # Global force history tokens are observed context and can attend bidirectionally with image/language prefix tokens.
             ar_mask += [False] * force_tokens.shape[1]
 
         # embed images
@@ -389,10 +401,10 @@ class Pi0(_model.BaseModel):
         ar_mask = []
         tokens = []
         if self.force_guidance:
-            force_token = self._embed_force_fast_token(obs, noisy_actions.dtype)
+            force_token = self._embed_force_local_token(obs, noisy_actions.dtype)
             tokens.append(force_token)
             input_mask.append(jnp.ones(force_token.shape[:2], dtype=jnp.bool_))
-            # Observed force history is a causal condition for state/action suffix tokens.
+            # Local force history is a causal condition for state/action suffix tokens.
             ar_mask += [True]
 
         if not self.pi05:

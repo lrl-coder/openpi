@@ -69,7 +69,9 @@ IMAGE_RESOLUTION = (224, 224)
 #     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model
 #     "token_loss_mask": bool[*b, l],  # Optional, loss mask for FAST model
 #     "force": float32[*b, 6],  # Optional, current force/torque observation
-#     "force_history": float32[*b, fh, 6],  # Optional, causal force/torque history ending at current step
+#     "force_history_global": float32[*b, fgh, 6],  # Optional, long force/torque history for VLM target
+#     "force_history_local": float32[*b, flh, 6],  # Optional, short force/torque history for action conditioning
+#     "force_history": float32[*b, fh, 6],  # Optional, legacy causal force/torque history
 #     "force_targets": float32[*b, ah, 6],  # Optional, next-step force labels
 #     "force_task_target": float32[*b, 6],  # Optional, legacy task-level force mean label
 #
@@ -112,6 +114,9 @@ class Observation(Generic[ArrayT]):
 
     # Force-aware pi0 extensions. These are optional so existing datasets and models are unchanged.
     force: at.Float[ArrayT, "*b f"] | None = None
+    force_history_global: at.Float[ArrayT, "*b fgh f"] | None = None
+    force_history_local: at.Float[ArrayT, "*b flh f"] | None = None
+    # Legacy alias used by earlier force-guided checkpoints and tools. New code prefers global/local histories.
     force_history: at.Float[ArrayT, "*b fh f"] | None = None
     force_targets: at.Float[ArrayT, "*b ah f"] | None = None
     # Legacy single-point task-level target. Force target head training prefers `force_targets` when present.
@@ -138,6 +143,8 @@ class Observation(Generic[ArrayT]):
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
             force=data.get("force"),
+            force_history_global=data.get("force_history_global"),
+            force_history_local=data.get("force_history_local"),
             force_history=data.get("force_history"),
             force_targets=data.get("force_targets"),
             force_task_target=data.get("force_task_target"),
@@ -221,6 +228,8 @@ def preprocess_observation(
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
         force=observation.force,
+        force_history_global=observation.force_history_global,
+        force_history_local=observation.force_history_local,
         force_history=observation.force_history,
         force_targets=observation.force_targets,
         force_task_target=observation.force_task_target,

@@ -50,12 +50,13 @@ class FlexivPumpInputs(_transforms.DataTransformFn):
 
     model_type: ModelType
     include_force_in_state: bool = False
-    force_history_len: int = 16
+    force_history_global_len: int = 64
+    force_history_local_len: int = 16
 
     def __call__(self, data: dict) -> dict:
         raw_state = np.asarray(data["observation/state"])
         if raw_state.ndim >= 2:
-            current_index = min(self.force_history_len - 1, raw_state.shape[0] - 1)
+            current_index = min(self.force_history_global_len - 1, raw_state.shape[0] - 1)
             current_state = raw_state[current_index]
             history_states = raw_state[: current_index + 1]
             future_states = raw_state[current_index + 1 :]
@@ -78,15 +79,12 @@ class FlexivPumpInputs(_transforms.DataTransformFn):
         current_force = current_state[7:13]
         inputs["force"] = current_force
         force_history = np.asarray(history_states[..., 7:13])
-        if force_history.shape[0] < self.force_history_len:
-            pad_count = self.force_history_len - force_history.shape[0]
-            force_history = np.concatenate(
-                [np.repeat(force_history[:1], pad_count, axis=0), force_history],
-                axis=0,
-            )
-        elif force_history.shape[0] > self.force_history_len:
-            force_history = force_history[-self.force_history_len :]
-        inputs["force_history"] = force_history
+        force_history_global = _left_pad_or_trim_history(force_history, self.force_history_global_len)
+        force_history_local = _left_pad_or_trim_history(force_history, self.force_history_local_len)
+        inputs["force_history_global"] = force_history_global
+        inputs["force_history_local"] = force_history_local
+        # Compatibility alias for older analysis/debug tools. The model now prefers global/local histories.
+        inputs["force_history"] = force_history_local
 
         if future_states is not None and "actions" in inputs:
             force_targets = future_states[..., 7:13]
@@ -110,6 +108,18 @@ class FlexivPumpInputs(_transforms.DataTransformFn):
         return inputs
 
 
+def _left_pad_or_trim_history(history: np.ndarray, target_len: int) -> np.ndarray:
+    if history.shape[0] < target_len:
+        pad_count = target_len - history.shape[0]
+        return np.concatenate(
+            [np.repeat(history[:1], pad_count, axis=0), history],
+            axis=0,
+        )
+    if history.shape[0] > target_len:
+        return history[-target_len:]
+    return history
+
+
 def _force_norm_stats_from_state(
     norm_stats: dict[str, _transforms.NormStats] | None,
 ) -> dict[str, _transforms.NormStats] | None:
@@ -126,6 +136,8 @@ def _force_norm_stats_from_state(
     return {
         **norm_stats,
         "force": force_stats,
+        "force_history_global": force_stats,
+        "force_history_local": force_stats,
         "force_history": force_stats,
         "force_targets": force_stats,
         "force_task_target": force_stats,
@@ -572,7 +584,8 @@ def _flexiv_pump_data_config(
     include_force: bool = False,
     force_guided: bool = False,
     assets_dir: str | None = None,
-    force_history_len: int = 16,
+    force_history_global_len: int = 64,
+    force_history_local_len: int = 16,
 ) -> SimpleDataConfig:
     # The dataset action is [target_eef_pose(6), target_gripper_width(1)].
     # pi0 is trained on delta actions for continuous robot motion, while gripper
@@ -591,7 +604,8 @@ def _flexiv_pump_data_config(
                 FlexivPumpInputs(
                     model_type=model.model_type,
                     include_force_in_state=include_force,
-                    force_history_len=force_history_len,
+                    force_history_global_len=force_history_global_len,
+                    force_history_local_len=force_history_local_len,
                 )
                 if force_guided
                 else SliceObservationState(state_dim),
@@ -607,7 +621,7 @@ def _flexiv_pump_data_config(
             prompt_from_task=True,
             action_sequence_keys=("action",),
             extra_delta_timestamp_steps={
-                "observation.state": tuple(range(-(force_history_len - 1), 51))
+                "observation.state": tuple(range(-(force_history_global_len - 1), 51))
             }
             if force_guided
             else {},

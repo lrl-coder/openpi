@@ -230,7 +230,7 @@
       <div>
         <h1>Force-Guided π0: Semantic Contact Targets for Contact-Rich Manipulation</h1>
         <div class="subtitle">
-          A clean three-lane view of the model: slow force history grounds the VLM's semantic contact target, fast force history conditions action generation, and runtime contact tension gates force-guided flow matching.
+          A clean three-lane view of the model: global force history grounds the VLM's semantic contact target, local force history conditions action generation, and runtime contact tension gates force-guided flow matching.
         </div>
       </div>
       <div class="legend" aria-label="Legend">
@@ -277,11 +277,11 @@
         <rect x="34" y="318" width="1432" height="260" class="lane"/>
         <rect x="34" y="616" width="1432" height="214" class="lane"/>
 
-        <text x="60" y="84" class="lane-label">1. Low-frequency semantic path</text>
-        <text x="60" y="106" class="lane-note">VLM reads image, language, and slow force tokens to infer the task-level contact target.</text>
+        <text x="60" y="84" class="lane-label">1. Global semantic path</text>
+        <text x="60" y="106" class="lane-note">VLM reads image, language, and long-horizon global force tokens to infer the task-level contact target.</text>
 
-        <text x="60" y="350" class="lane-label">2. High-frequency action path</text>
-        <text x="60" y="372" class="lane-note">The action expert consumes state, fast force token, and action tokens; final action-token states support both action and force decoding.</text>
+        <text x="60" y="350" class="lane-label">2. Local action path</text>
+        <text x="60" y="372" class="lane-note">The action expert consumes state, short-horizon local force token, and action tokens; final action-token states support both action and force decoding.</text>
 
         <text x="60" y="648" class="lane-label">3. Runtime contact feedback</text>
         <text x="60" y="670" class="lane-note">CST compares measured contact with the previous action-conditioned prediction and gates guidance.</text>
@@ -310,10 +310,10 @@
         <rect x="72" y="508" width="178" height="48" class="box slate"/>
         <text x="95" y="538" class="small-title">State q_t</text>
 
-        <!-- Slow force tokenizer -->
+        <!-- Global force tokenizer -->
         <rect x="314" y="126" width="216" height="94" class="box cyan"/>
-        <text x="340" y="156" class="small-title">Slow force tokenizer</text>
-        <text x="340" y="181" class="formula">patch(16×6) → 4 tokens</text>
+        <text x="340" y="156" class="small-title">Global force tokenizer</text>
+        <text x="340" y="181" class="formula">patch(64×6) → 8 tokens</text>
         <text x="340" y="203" class="tiny">Linear projection + force positions</text>
 
         <g transform="translate(344 238)">
@@ -321,13 +321,13 @@
           <rect x="44" y="0" width="34" height="22" class="token token-cyan"/>
           <rect x="88" y="0" width="34" height="22" class="token token-cyan"/>
           <rect x="132" y="0" width="34" height="22" class="token token-cyan"/>
-          <text x="0" y="-10" class="tiny">force slow tokens</text>
+          <text x="0" y="-10" class="tiny">force global tokens</text>
         </g>
 
         <!-- VLM prefix -->
         <rect x="590" y="108" width="272" height="138" class="box blue"/>
         <text x="620" y="140" class="title">VLM / PaliGemma prefix</text>
-        <text x="620" y="167" class="tiny">vision + language + slow force tokens</text>
+        <text x="620" y="167" class="tiny">vision + language + global force tokens</text>
         <g transform="translate(622 188)">
           <rect x="0" y="0" width="28" height="21" class="token token-blue"/>
           <rect x="37" y="0" width="28" height="21" class="token token-blue"/>
@@ -349,14 +349,14 @@
         <text x="1228" y="182" class="formula">Σ* = diag(exp(2 log σ*))</text>
         <text x="1228" y="204" class="tiny">what should successful contact feel like?</text>
 
-        <!-- Fast force encoder -->
+        <!-- Local force encoder -->
         <rect x="314" y="402" width="216" height="100" class="box cyan"/>
-        <text x="340" y="433" class="small-title">Fast force encoder</text>
+        <text x="340" y="433" class="small-title">Local force encoder</text>
         <text x="340" y="459" class="formula">causal dilated Conv1D</text>
         <text x="340" y="481" class="formula">pool → force condition token</text>
 
         <rect x="348" y="522" width="148" height="34" class="box cyan"/>
-        <text x="374" y="544" class="label">fast force token</text>
+        <text x="374" y="544" class="label">local force token</text>
 
         <!-- Action expert -->
         <rect x="590" y="370" width="284" height="166" class="box purple"/>
@@ -461,7 +461,7 @@
       </svg>
 
       <div class="caption">
-        <strong>Figure.</strong> The diagram is organized as three non-overlapping flows. The semantic lane builds a task-level force target <strong>(μ*, Σ*)</strong> from VLM prefix tokens enriched by slow force history. The action lane uses a fast force token to condition π0's action expert; the final action-token hidden states are read by both the flow head and <strong>F<sub>φ</sub></strong>. The runtime lane computes CST from measured force and the previous prediction, producing <strong>λ(τ)</strong> that gates a force-guided flow term. Arrows converge only at the guided sampler, making the feedback structure explicit without clutter.
+        <strong>Figure.</strong> The diagram is organized as three non-overlapping flows. The semantic lane builds a task-level force target <strong>(μ*, Σ*)</strong> from VLM prefix tokens enriched by global force history. The action lane uses a local force token to condition π0's action expert; the final action-token hidden states are read by both the flow head and <strong>F<sub>φ</sub></strong>. The runtime lane computes CST from measured force and the previous prediction, producing <strong>λ(τ)</strong> that gates a force-guided flow term. Arrows converge only at the guided sampler, making the feedback structure explicit without clutter.
       </div>
     </section>
   </main>
