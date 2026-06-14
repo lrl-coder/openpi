@@ -50,15 +50,19 @@ class FlexivPumpInputs(_transforms.DataTransformFn):
 
     model_type: ModelType
     include_force_in_state: bool = False
+    force_history_len: int = 16
 
     def __call__(self, data: dict) -> dict:
         raw_state = np.asarray(data["observation/state"])
         if raw_state.ndim >= 2:
-            current_state = raw_state[0]
-            force_sequence = raw_state[..., 7:13]
+            current_index = min(self.force_history_len - 1, raw_state.shape[0] - 1)
+            current_state = raw_state[current_index]
+            history_states = raw_state[: current_index + 1]
+            future_states = raw_state[current_index + 1 :]
         else:
             current_state = raw_state
-            force_sequence = None
+            history_states = raw_state[None, :]
+            future_states = None
 
         if current_state.shape[-1] < 13:
             raise ValueError(
@@ -73,9 +77,19 @@ class FlexivPumpInputs(_transforms.DataTransformFn):
 
         current_force = current_state[7:13]
         inputs["force"] = current_force
+        force_history = np.asarray(history_states[..., 7:13])
+        if force_history.shape[0] < self.force_history_len:
+            pad_count = self.force_history_len - force_history.shape[0]
+            force_history = np.concatenate(
+                [np.repeat(force_history[:1], pad_count, axis=0), force_history],
+                axis=0,
+            )
+        elif force_history.shape[0] > self.force_history_len:
+            force_history = force_history[-self.force_history_len :]
+        inputs["force_history"] = force_history
 
-        if force_sequence is not None and "actions" in inputs:
-            force_targets = force_sequence[1:]
+        if future_states is not None and "actions" in inputs:
+            force_targets = future_states[..., 7:13]
             action_horizon = inputs["actions"].shape[0]
             if force_targets.shape[0] == 0:
                 force_targets = np.repeat(current_force[None, :], action_horizon, axis=0)
@@ -112,6 +126,7 @@ def _force_norm_stats_from_state(
     return {
         **norm_stats,
         "force": force_stats,
+        "force_history": force_stats,
         "force_targets": force_stats,
         "force_task_target": force_stats,
     }
@@ -557,6 +572,7 @@ def _flexiv_pump_data_config(
     include_force: bool = False,
     force_guided: bool = False,
     assets_dir: str | None = None,
+    force_history_len: int = 16,
 ) -> SimpleDataConfig:
     # The dataset action is [target_eef_pose(6), target_gripper_width(1)].
     # pi0 is trained on delta actions for continuous robot motion, while gripper
@@ -572,7 +588,11 @@ def _flexiv_pump_data_config(
         ),
         data_transforms=lambda model: _transforms.Group(
             inputs=[
-                FlexivPumpInputs(model_type=model.model_type, include_force_in_state=include_force)
+                FlexivPumpInputs(
+                    model_type=model.model_type,
+                    include_force_in_state=include_force,
+                    force_history_len=force_history_len,
+                )
                 if force_guided
                 else SliceObservationState(state_dim),
                 *([] if force_guided else [libero_policy.LiberoInputs(model_type=model.model_type)]),
@@ -586,7 +606,11 @@ def _flexiv_pump_data_config(
         base_config=DataConfig(
             prompt_from_task=True,
             action_sequence_keys=("action",),
-            extra_delta_timestamp_steps={"observation.state": tuple(range(51))} if force_guided else {},
+            extra_delta_timestamp_steps={
+                "observation.state": tuple(range(-(force_history_len - 1), 51))
+            }
+            if force_guided
+            else {},
             derive_force_norm_stats_from_state=force_guided,
             repack_transforms=_transforms.Group(
                 inputs=[

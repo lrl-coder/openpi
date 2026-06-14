@@ -72,6 +72,8 @@ class Pi0(_model.BaseModel):
         self.pi05 = config.pi05
         self.force_guidance = config.force_guidance
         self.force_dim = config.force_dim
+        self.force_history_len = config.force_history_len
+        self.force_slow_patch_size = config.force_slow_patch_size
         self.force_loss_weight = config.force_loss_weight
         self.force_target_loss_weight = config.force_target_loss_weight
         self.force_guidance_lambda_max = config.force_guidance_lambda_max
@@ -110,21 +112,98 @@ class Pi0(_model.BaseModel):
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
         if self.force_guidance:
+            # Deprecated compatibility layer: older force-guided checkpoints contain this
+            # parameter. The active F_phi below decodes directly from action-expert hidden states.
             force_predictor_input_dim = (
                 config.action_dim + config.action_dim + config.force_dim + paligemma_config.width
             )
             self.force_predictor_in = nnx.Linear(force_predictor_input_dim, action_expert_config.width, rngs=rngs)
             self.force_predictor_out = nnx.Linear(action_expert_config.width, 2 * config.force_dim, rngs=rngs)
+            force_slow_patch_dim = config.force_slow_patch_size * config.force_dim
+            self.force_slow_patch_proj = nnx.Linear(force_slow_patch_dim, paligemma_config.width, rngs=rngs)
+            self.force_slow_pos_embedding = nnx.Param(
+                jnp.zeros((self.force_num_slow_tokens, paligemma_config.width), dtype=jnp.float32)
+            )
+            self.force_fast_conv1 = nnx.Conv(
+                config.force_dim, 64, kernel_size=3, padding="CAUSAL", rngs=rngs
+            )
+            self.force_fast_norm1 = nnx.LayerNorm(64, rngs=rngs)
+            self.force_fast_conv2 = nnx.Conv(
+                64, 128, kernel_size=3, padding="CAUSAL", kernel_dilation=2, rngs=rngs
+            )
+            self.force_fast_norm2 = nnx.LayerNorm(128, rngs=rngs)
+            self.force_fast_conv3 = nnx.Conv(
+                128,
+                action_expert_config.width,
+                kernel_size=3,
+                padding="CAUSAL",
+                kernel_dilation=4,
+                rngs=rngs,
+            )
+            self.force_fast_norm3 = nnx.LayerNorm(action_expert_config.width, rngs=rngs)
+            self.force_fast_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.force_target_in = nnx.Linear(paligemma_config.width, action_expert_config.width, rngs=rngs)
             self.force_target_out = nnx.Linear(action_expert_config.width, 2 * config.force_dim, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
+    @property
+    def force_num_slow_tokens(self) -> int:
+        return math.ceil(self.force_history_len / self.force_slow_patch_size)
+
     def _pool_prefix(self, prefix_out, prefix_mask):
         mask = prefix_mask.astype(prefix_out.dtype)[..., None]
         denom = jnp.maximum(jnp.sum(mask, axis=1), 1.0)
         return jnp.sum(prefix_out * mask, axis=1) / denom
+
+    def _force_history_or_current(self, obs: _model.Observation, dtype):
+        batch_size = obs.state.shape[0]
+        if obs.force_history is not None:
+            force_history = obs.force_history.astype(dtype)
+        elif obs.force is not None:
+            force_history = einops.repeat(obs.force.astype(dtype), "b f -> b h f", h=self.force_history_len)
+        else:
+            force_history = jnp.zeros((batch_size, self.force_history_len, self.force_dim), dtype=dtype)
+
+        history_len = force_history.shape[1]
+        if history_len < self.force_history_len:
+            pad = jnp.repeat(force_history[:, :1, :], self.force_history_len - history_len, axis=1)
+            force_history = jnp.concatenate([pad, force_history], axis=1)
+        elif history_len > self.force_history_len:
+            force_history = force_history[:, -self.force_history_len :, :]
+        return force_history
+
+    def _embed_force_slow_tokens(self, obs: _model.Observation, dtype):
+        force_history = self._force_history_or_current(obs, dtype)
+        pad_len = self.force_num_slow_tokens * self.force_slow_patch_size - self.force_history_len
+        if pad_len > 0:
+            force_history = jnp.pad(force_history, ((0, 0), (pad_len, 0), (0, 0)))
+        patches = einops.rearrange(
+            force_history,
+            "b (n p) f -> b n (p f)",
+            n=self.force_num_slow_tokens,
+            p=self.force_slow_patch_size,
+        )
+        tokens = self.force_slow_patch_proj(patches)
+        pos = self.force_slow_pos_embedding.value.astype(tokens.dtype)
+        return tokens + pos[None, :, :]
+
+    def _embed_force_fast_token(self, obs: _model.Observation, dtype):
+        force_history = self._force_history_or_current(obs, dtype)
+        hidden = self.force_fast_conv1(force_history)
+        hidden = self.force_fast_norm1(hidden)
+        hidden = nnx.swish(hidden)
+        hidden = self.force_fast_conv2(hidden)
+        hidden = self.force_fast_norm2(hidden)
+        hidden = nnx.swish(hidden)
+        hidden = self.force_fast_conv3(hidden)
+        hidden = self.force_fast_norm3(hidden)
+        hidden = nnx.swish(hidden)
+        pooled = jnp.mean(hidden, axis=1)
+        pooled = self.force_fast_out(pooled)
+        pooled = nnx.swish(pooled)
+        return pooled[:, None, :]
 
     def _split_force_distribution(self, x):
         mu, log_sigma = jnp.split(x.astype(jnp.float32), 2, axis=-1)
@@ -135,22 +214,51 @@ class Pi0(_model.BaseModel):
         hidden = nnx.swish(hidden)
         return self._split_force_distribution(self.force_target_out(hidden))
 
-    def _predict_force(self, clean_actions, obs: _model.Observation, prefix_pooled):
-        batch_size, horizon = clean_actions.shape[:2]
-        force = obs.force
-        if force is None:
-            force = jnp.zeros((batch_size, self.force_dim), dtype=clean_actions.dtype)
-        else:
-            force = force.astype(clean_actions.dtype)
+    def _decode_force_from_action_features(self, action_features):
+        return self._split_force_distribution(self.force_predictor_out(action_features))
 
-        state_tokens = einops.repeat(obs.state.astype(clean_actions.dtype), "b d -> b h d", h=horizon)
-        force_tokens = einops.repeat(force, "b d -> b h d", h=horizon)
-        prefix_tokens = einops.repeat(prefix_pooled.astype(clean_actions.dtype), "b d -> b h d", h=horizon)
-        inputs = jnp.concatenate([clean_actions, state_tokens, force_tokens, prefix_tokens], axis=-1)
+    def _action_features_from_prefix_cache(
+        self,
+        obs: _model.Observation,
+        actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
+        prefix_mask,
+        kv_cache,
+    ):
+        batch_size = actions.shape[0]
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(obs, actions, timestep)
+        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+        prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+        full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+        assert full_attn_mask.shape == (
+            batch_size,
+            suffix_tokens.shape[1],
+            prefix_mask.shape[1] + suffix_tokens.shape[1],
+        )
+        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
-        hidden = self.force_predictor_in(inputs)
-        hidden = nnx.swish(hidden)
-        return self._split_force_distribution(self.force_predictor_out(hidden))
+        (step_prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_attn_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
+        )
+        assert step_prefix_out is None
+        return suffix_out[:, -self.action_horizon :]
+
+    def _predict_force_from_action_head(
+        self,
+        obs: _model.Observation,
+        actions: _model.Actions,
+        prefix_mask,
+        kv_cache,
+        timestep: at.Float[at.Array, " b"] | None = None,
+    ):
+        if timestep is None:
+            timestep = jnp.zeros((actions.shape[0],), dtype=actions.dtype)
+        action_features = self._action_features_from_prefix_cache(obs, actions, timestep, prefix_mask, kv_cache)
+        return self._decode_force_from_action_features(action_features)
 
     def _diag_gaussian_nll(self, target, mu, log_sigma):
         log_sigma = jnp.clip(log_sigma, -5.0, 3.0)
@@ -224,9 +332,8 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (prefix_out, _), _ = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
-        prefix_pooled = self._pool_prefix(prefix_out, prefix_mask)
-        return self._predict_force(actions, observation, prefix_pooled)
+        (_, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        return self._predict_force_from_action_head(observation, actions, prefix_mask, kv_cache)
 
     @at.typecheck
     def embed_prefix(
@@ -235,6 +342,13 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
+        if self.force_guidance:
+            force_tokens = self._embed_force_slow_tokens(obs, next(iter(obs.images.values())).dtype)
+            tokens.append(force_tokens)
+            input_mask.append(jnp.ones(force_tokens.shape[:2], dtype=jnp.bool_))
+            # Force history tokens are observed context and can attend bidirectionally with image/language prefix tokens.
+            ar_mask += [False] * force_tokens.shape[1]
+
         # embed images
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
@@ -274,6 +388,13 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
+        if self.force_guidance:
+            force_token = self._embed_force_fast_token(obs, noisy_actions.dtype)
+            tokens.append(force_token)
+            input_mask.append(jnp.ones(force_token.shape[:2], dtype=jnp.bool_))
+            # Observed force history is a causal condition for state/action suffix tokens.
+            ar_mask += [True]
+
         if not self.pi05:
             # add a single state token
             state_token = self.state_proj(obs.state)[:, None, :]
@@ -342,17 +463,15 @@ class Pi0(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # one big forward pass of prefix + suffix at once
+        # Fill the prefix KV cache once. The action head and F_phi both decode from suffix hidden features.
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
-        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
-        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
-        attn_mask = make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        action_features = self._action_features_from_prefix_cache(observation, x_t, time, prefix_mask, kv_cache)
+        v_t = self.action_out_proj(action_features)
 
         fm_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
         loss = fm_loss
@@ -364,7 +483,9 @@ class Pi0(_model.BaseModel):
         prefix_pooled = self._pool_prefix(prefix_out, prefix_mask)
 
         if self.force_loss_weight > 0.0 and observation.force_targets is not None:
-            force_mu, force_log_sigma = self._predict_force(actions, observation, prefix_pooled)
+            force_mu, force_log_sigma = self._predict_force_from_action_head(
+                observation, actions, prefix_mask, kv_cache
+            )
             force_loss = self._diag_gaussian_nll(observation.force_targets, force_mu, force_log_sigma)
             loss = loss + self.force_loss_weight * force_loss
             if return_info:
@@ -509,7 +630,13 @@ class Pi0(_model.BaseModel):
 
                 def guidance_nll(action_sample):
                     clean_action_estimate = action_sample - time * base_v_t
-                    force_mu, _ = self._predict_force(clean_action_estimate, observation, prefix_pooled)
+                    force_mu, _ = self._predict_force_from_action_head(
+                        observation,
+                        clean_action_estimate,
+                        prefix_mask,
+                        kv_cache,
+                        jnp.zeros((batch_size,), dtype=clean_action_estimate.dtype),
+                    )
                     nll = self._diag_gaussian_nll(
                         force_target_mu[:, None, :],
                         force_mu,

@@ -146,13 +146,14 @@ force-guided 配置会始终从原始 13 维 `observation.state` 里拆出最后
 
 ```text
 force              = observation.state[7:13]
+force_history      = 因果历史 force 窗口, shape = (16, 6)
 force_targets      = 下一时刻 force 序列, shape = (50, 6)
 force_task_target  = 当前 action chunk 内 force_targets 的均值, shape = (6,), 仅作为兼容字段
 ```
 
-`*_force_guided` 默认仍只把前 7 维送进 pi0 的常规 `state` token；力通过新增的 `F_phi` 和 semantic target head 进入辅助损失与推理引导。`*_with_force_guided` 则同时把完整 13 维送进常规 `state` token，用于做对照实验。
+`*_force_guided` 默认仍只把前 7 维送进 pi0 的常规 `state` token；力通过 `force_history` 的双路径编码进入 VLM prefix 和动作头 suffix，并通过 `F_phi`、semantic target head、CST 引导影响训练和推理。`*_with_force_guided` 则同时把完整 13 维送进常规 `state` token，用于做对照实验。
 
-注意：所有 `*_force_guided` 配置在训练和推理时都要求输入原始 13 维 `observation/state`，因为当前力 `force = state[7:13]` 是 CST 和 `F_phi` 的输入。区别只在于常规 pi0 state token 使用前 7 维还是完整 13 维。
+注意：所有 `*_force_guided` 配置在训练和推理时都要求输入原始 13 维 `observation/state`，因为当前力 `force = state[7:13]` 会被用于构造 `force_history`、CST 和 `F_phi`。区别只在于常规 pi0 state token 使用前 7 维还是完整 13 维。
 
 pi0 需要 32 维 state/action，所以 openpi 会把 7 维或 13 维 state 自动 pad 到 32 维。`action` 原始是 7 维：
 
@@ -347,19 +348,22 @@ uv run scripts/train.py pi0_flexiv_pump_1bottle_inputForce_lora_force_guided \
   --overwrite
 ```
 
-该配置复用已有 baseline norm stats，并自动从 `state[7:13]` 派生 `force`、`force_targets`、`force_task_target` 的归一化统计，不需要单独复制一份 norm stats。
+该配置复用已有 baseline norm stats，并自动从 `state[7:13]` 派生 `force`、`force_history`、`force_targets`、`force_task_target` 的归一化统计，不需要单独复制一份 norm stats。
 
 当前实现包含：
 
 ```text
-VLM semantic force target head: C_pool -> (mu*, log_sigma*)
-Action auxiliary force predictor F_phi: (a, C_pool, state, force) -> (mu_f, log_sigma_f)
+force_history: 16 x 6, 对应当前帧及过去 15 帧
+VLM slow path: force_history -> 4 个 force patch tokens -> VLM prefix
+Action fast path: force_history -> causal dilated Conv1D -> force condition token -> action suffix
+VLM semantic force target head: C_pool(image, language, force tokens) -> (mu*, log_sigma*)
+Action auxiliary force predictor F_phi: action-head hidden features -> (mu_f, log_sigma_f)
 Training loss: L = L_FM + 0.05 * L_F_phi + 0.01 * L_target
 Policy CST: tau = sum((f_t - mu_{f,t-1})^2 / sigma_{f,t-1}^2)
 Guided sampling: lambda(tau) = 0.2 * sigmoid(1.0 * (tau - 6.0))
 ```
 
-训练监督里，`F_phi` 使用 action chunk 中每个示范动作对应的下一帧 force 作为标签。
+训练监督里，`F_phi` 不再是独立拼接 MLP；它挂在原动作头的 action-token hidden features 后面，只做数值解码。标签仍使用 action chunk 中每个示范动作对应的下一帧 force。
 VLM semantic force target head 的 `L_target` 当前优先使用整段 `force_targets` 作为 NLL 目标，而不是单点 `force_task_target`。也就是说，`(mu*, sigma*)` 对 `(B, 50, 6)` 的力序列广播，监督目标是 chunk 内力分布：
 
 ```text
@@ -551,6 +555,8 @@ lambda(tau) = 0.2 * sigmoid(1.0 * (tau - 6.0))
 
 第一次推理没有上一帧力预测，因此不会引导；从第二次推理开始生效。
 
+无论是否启用 CST 引导，force-guided policy 都会维护一个长度为 16 的滑动 `force_history`。第一次推理时用当前力重复填满窗口，之后每次推理追加当前力并丢弃最旧力。
+
 客户端传入 observation 时字段应保持为：
 
 ```python
@@ -630,6 +636,7 @@ obs, actions = next(iter(dl))
 
 print("state", obs.state.shape, obs.state.dtype)
 print("force", obs.force.shape, obs.force.dtype)
+print("force_history", obs.force_history.shape, obs.force_history.dtype)
 print("force_targets", obs.force_targets.shape, obs.force_targets.dtype)
 print("force_task_target", obs.force_task_target.shape, obs.force_task_target.dtype)
 print("actions", actions.shape, actions.dtype)
@@ -641,6 +648,7 @@ PY
 ```text
 state (16, 32) float32
 force (16, 6) float32
+force_history (16, 16, 6) float32
 force_targets (16, 50, 6) float32
 force_task_target (16, 6) float32
 actions (16, 50, 32) float32

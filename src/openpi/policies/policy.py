@@ -55,8 +55,13 @@ class Policy(BasePolicy):
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
         self._force_guidance_enabled = bool(self._sample_kwargs.pop("force_guidance_from_cst", False))
+        self._force_model_enabled = bool(getattr(model, "force_guidance", False))
         self._prev_force_mu = None
         self._prev_force_log_sigma = None
+        self._force_history = None
+        self._force_history_len = int(getattr(getattr(model, "config", None), "force_history_len", 16))
+        if hasattr(model, "force_history_len"):
+            self._force_history_len = int(model.force_history_len)
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -78,10 +83,18 @@ class Policy(BasePolicy):
         if bool(np.asarray(obs.get("reset", False))):
             self._prev_force_mu = None
             self._prev_force_log_sigma = None
+            self._force_history = None
 
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
+        if self._force_model_enabled and not self._is_pytorch_model and "force" in inputs:
+            current_force = np.asarray(inputs["force"])
+            if self._force_history is None:
+                self._force_history = np.repeat(current_force[None, :], self._force_history_len, axis=0)
+            else:
+                self._force_history = np.concatenate([self._force_history[1:], current_force[None, :]], axis=0)
+            inputs["force_history"] = self._force_history
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
