@@ -330,6 +330,14 @@ current_eef_pose(6), gripper_width(1), f_ext_base_frame(6)
 
 ## Force-guided 训练
 
+模型主图 HTML 在：
+
+```text
+/root/autodl-tmp/openpi/docs/force_guided_pi0_main_figure.html
+```
+
+可以直接用浏览器打开并截图，用于论文草图或汇报。
+
 新增方案对应四个配置：
 
 ```text
