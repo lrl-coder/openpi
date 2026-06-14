@@ -1,6 +1,8 @@
+import csv
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
@@ -26,6 +28,17 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+
+
+_CONSOLE_LOG_KEYS = (
+    "loss",
+    "grad_norm",
+    "param_norm",
+    "diagnostic_loss",
+    "loss_fm",
+    "force_nll",
+    "force_target_nll",
+)
 
 
 def init_logging():
@@ -68,6 +81,69 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
+
+
+def _scalar_metric_value(value: Any) -> float | int | str:
+    """Converts a scalar metric to a CSV-friendly Python value."""
+    array = np.asarray(value)
+    if array.shape == ():
+        item = array.item()
+        if isinstance(item, (np.integer, int)):
+            return int(item)
+        if isinstance(item, (np.floating, float)):
+            return float(item)
+        return str(item)
+    return str(array.tolist())
+
+
+def _format_metric_summary(metrics: dict[str, Any]) -> str:
+    keys = [key for key in _CONSOLE_LOG_KEYS if key in metrics]
+    if not keys:
+        keys = list(metrics)[:8]
+    return ", ".join(f"{key}={float(np.asarray(metrics[key])):.4f}" for key in keys)
+
+
+class CsvMetricLogger:
+    """Writes scalar training metrics to CSV while allowing new columns over time."""
+
+    def __init__(self, path: epath.Path, *, resume: bool):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fieldnames = ["step"]
+        self.rows: list[dict[str, Any]] = []
+
+        if resume and self.path.exists():
+            with open(self.path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                self.fieldnames = list(reader.fieldnames or self.fieldnames)
+                self.rows = list(reader)
+        elif self.path.exists():
+            self.path.unlink()
+
+    def write(self, step: int, metrics: dict[str, Any]) -> None:
+        row = {"step": int(step)}
+        row.update({key: _scalar_metric_value(value) for key, value in metrics.items()})
+
+        new_fields = [key for key in row if key not in self.fieldnames]
+        if new_fields:
+            self.fieldnames.extend(new_fields)
+            self.rows.append(row)
+            self._rewrite()
+            return
+
+        self.rows.append(row)
+        file_exists = self.path.exists()
+        with open(self.path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            if not file_exists or os.path.getsize(self.path) == 0:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def _rewrite(self) -> None:
+        with open(self.path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writeheader()
+            writer.writerows(self.rows)
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -277,6 +353,8 @@ def main(config: _config.TrainConfig):
         out_shardings=replicated_sharding,
     )
     log_force_diagnostics = bool(getattr(config.model, "force_guidance", False))
+    csv_metric_logger = CsvMetricLogger(config.checkpoint_dir / "metrics.csv", resume=resuming)
+    logging.info(f"Writing scalar metrics to: {csv_metric_logger.path}")
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -298,8 +376,8 @@ def main(config: _config.TrainConfig):
                 with sharding.set_mesh(mesh):
                     diagnostic_info = pdiagnostic_step(train_rng, train_state, batch)
                 reduced_info.update(jax.device_get(jax.tree.map(jnp.mean, diagnostic_info)))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
+            csv_metric_logger.write(step, reduced_info)
+            pbar.write(f"Step {step}: {_format_metric_summary(reduced_info)}")
             wandb.log(reduced_info, step=step)
             infos = []
         batch = next(data_iter)

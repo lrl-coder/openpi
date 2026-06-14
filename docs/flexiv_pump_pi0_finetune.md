@@ -92,7 +92,7 @@ wandb_enabled       = True
 fsdp_devices        = 1
 ```
 
-也就是说，默认每 100 step 打印/记录一次日志，每 1000 step 保存一次 checkpoint，且每 5000 step 的 checkpoint 会被保留。
+也就是说，默认每 100 step 打印/记录一次日志，每 1000 step 保存一次 checkpoint，且每 5000 step 的 checkpoint 会被保留。终端只打印核心摘要，完整 scalar 指标会写入 checkpoint 目录下的 `metrics.csv`，同时继续写入 wandb。
 
 如果想临时覆盖配置，不一定要改代码，可以在训练命令后加参数。例如只训练 5000 step、关闭 wandb：
 
@@ -374,7 +374,7 @@ L_target = mean_t NLL(force_targets[:, t, :] ; mu*, sigma*)
 
 ### Force NLL / 方差诊断
 
-force-guided 训练会额外在日志 step 跑一次无梯度诊断前向，并把力预测分布指标写到 tqdm 和 wandb。训练反向仍只走原来的 `train_step`，诊断不进入梯度图。
+force-guided 训练会额外在日志 step 跑一次无梯度诊断前向，并把力预测分布指标写到 checkpoint 目录下的 `metrics.csv` 和 wandb。终端 tqdm 只显示核心摘要，训练反向仍只走原来的 `train_step`，诊断不进入梯度图。
 
 连续高斯 NLL 可以是负数，这本身不是数值错误。因为 NLL 里有 `log(sigma)` 项，当力标签已经归一化、预测残差很小、模型预测的 `sigma < 1` 时，`L_F_phi` 或 `L_target` 可以小于 0。需要判断的是方差是否坍塌。旧版本曾用 `force_task_target` 单点均值监督 `L_target`，这会让 `sigma*` 学到均值预测残差而不是示范力分布方差；现在已经改为优先用整段 `force_targets` 监督。
 
@@ -504,6 +504,29 @@ openpi 预训练权重缓存当前实际写到：
 
 ```text
 /root/autodl-fs/openpi
+```
+
+### CSV 指标日志
+
+训练脚本会把完整 scalar 指标写到当前实验 checkpoint 目录：
+
+```text
+/root/autodl-fs/openpi_checkpoints/<config_name>/<exp_name>/metrics.csv
+```
+
+例如当前 force-guided 命令对应：
+
+```text
+/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora_force_guided/flexiv_pump_lora_force_guided/metrics.csv
+```
+
+终端只会打印短摘要，例如 `loss`, `grad_norm`, `diagnostic_loss`, `loss_fm`, `force_nll`, `force_target_nll`。完整的 `force_pred_*`, `force_target_*` 方差诊断都在 CSV 里，后续可以直接用 pandas 分析：
+
+```python
+import pandas as pd
+
+df = pd.read_csv("/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora_force_guided/flexiv_pump_lora_force_guided/metrics.csv")
+print(df[["step", "loss", "force_nll", "force_target_nll", "force_pred_sigma_mean"]].tail())
 ```
 
 ### wandb
