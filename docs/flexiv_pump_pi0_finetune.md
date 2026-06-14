@@ -147,7 +147,7 @@ force-guided 配置会始终从原始 13 维 `observation.state` 里拆出最后
 ```text
 force              = observation.state[7:13]
 force_targets      = 下一时刻 force 序列, shape = (50, 6)
-force_task_target  = 当前 action chunk 内 force_targets 的均值, shape = (6,)
+force_task_target  = 当前 action chunk 内 force_targets 的均值, shape = (6,), 仅作为兼容字段
 ```
 
 `*_force_guided` 默认仍只把前 7 维送进 pi0 的常规 `state` token；力通过新增的 `F_phi` 和 semantic target head 进入辅助损失与推理引导。`*_with_force_guided` 则同时把完整 13 维送进常规 `state` token，用于做对照实验。
@@ -359,13 +359,20 @@ Policy CST: tau = sum((f_t - mu_{f,t-1})^2 / sigma_{f,t-1}^2)
 Guided sampling: lambda(tau) = 0.2 * sigmoid(1.0 * (tau - 6.0))
 ```
 
-训练监督里，`F_phi` 使用 action chunk 中每个示范动作对应的下一帧 force 作为标签；`force_task_target` 暂时用当前 action chunk 内下一帧 force 的均值作为任务级目标标签。
+训练监督里，`F_phi` 使用 action chunk 中每个示范动作对应的下一帧 force 作为标签。
+VLM semantic force target head 的 `L_target` 当前优先使用整段 `force_targets` 作为 NLL 目标，而不是单点 `force_task_target`。也就是说，`(mu*, sigma*)` 对 `(B, 50, 6)` 的力序列广播，监督目标是 chunk 内力分布：
+
+```text
+L_target = mean_t NLL(force_targets[:, t, :] ; mu*, sigma*)
+```
+
+这样 `sigma*` 的最优解对应 force 序列的经验方差，而不是 `mu*` 对单点均值的预测残差方差。只有当 `force_targets` 不存在时，代码才会回退到 legacy 的 `force_task_target` 单点监督。
 
 ### Force NLL / 方差诊断
 
 force-guided 训练会额外在日志 step 跑一次无梯度诊断前向，并把力预测分布指标写到 tqdm 和 wandb。训练反向仍只走原来的 `train_step`，诊断不进入梯度图。
 
-连续高斯 NLL 可以是负数，这本身不是数值错误。因为 NLL 里有 `log(sigma)` 项，当力标签已经归一化、预测残差很小、模型预测的 `sigma < 1` 时，`L_F_phi` 或 `L_target` 可以小于 0。需要判断的是方差是否坍塌。
+连续高斯 NLL 可以是负数，这本身不是数值错误。因为 NLL 里有 `log(sigma)` 项，当力标签已经归一化、预测残差很小、模型预测的 `sigma < 1` 时，`L_F_phi` 或 `L_target` 可以小于 0。需要判断的是方差是否坍塌。旧版本曾用 `force_task_target` 单点均值监督 `L_target`，这会让 `sigma*` 学到均值预测残差而不是示范力分布方差；现在已经改为优先用整段 `force_targets` 监督。
 
 重点看这些指标：
 
@@ -399,6 +406,8 @@ force_pred_var_axis_0..5
 force_true_var_axis_0..5
 force_pred_var_minus_true_var_axis_0..5
 force_residual_mse_axis_0..5
+force_target_true_var_within_horizon_axis_0..5
+force_target_pred_var_minus_true_var_within_horizon_axis_0..5
 ```
 
 判断方式：

@@ -201,6 +201,15 @@ class Pi0(_model.BaseModel):
             info[f"{prefix}_true_var_axis_{axis}"] = true_var_axis[axis]
             info[f"{prefix}_pred_var_minus_true_var_axis_{axis}"] = var_gap_axis[axis]
             info[f"{prefix}_residual_mse_axis_{axis}"] = residual_mse_axis[axis]
+        if target.ndim == 3:
+            within_horizon_var_axis = jnp.mean(jnp.var(target, axis=1), axis=0)
+            within_horizon_gap_axis = pred_var_axis - within_horizon_var_axis
+            info[f"{prefix}_true_var_within_horizon_mean"] = jnp.mean(within_horizon_var_axis)
+            info[f"{prefix}_pred_var_minus_true_var_within_horizon_mean"] = jnp.mean(within_horizon_gap_axis)
+            info[f"{prefix}_pred_var_abs_gap_within_horizon_mean"] = jnp.mean(jnp.abs(within_horizon_gap_axis))
+            for axis in range(self.force_dim):
+                info[f"{prefix}_true_var_within_horizon_axis_{axis}"] = within_horizon_var_axis[axis]
+                info[f"{prefix}_pred_var_minus_true_var_within_horizon_axis_{axis}"] = within_horizon_gap_axis[axis]
         return info
 
     def predict_force(
@@ -371,19 +380,33 @@ class Pi0(_model.BaseModel):
                     )
                 )
 
-        if self.force_target_loss_weight > 0.0 and observation.force_task_target is not None:
+        if self.force_target_loss_weight > 0.0 and (
+            observation.force_targets is not None or observation.force_task_target is not None
+        ):
             target_mu, target_log_sigma = self._predict_force_target(prefix_pooled)
-            target_loss = self._diag_gaussian_nll(observation.force_task_target, target_mu, target_log_sigma)
-            loss = loss + self.force_target_loss_weight * target_loss[:, None]
+            if observation.force_targets is not None:
+                target_labels = observation.force_targets
+                target_loss = self._diag_gaussian_nll(
+                    target_labels,
+                    target_mu[:, None, :],
+                    target_log_sigma[:, None, :],
+                )
+                target_loss_for_chunk = target_loss
+            else:
+                target_labels = observation.force_task_target
+                target_loss = self._diag_gaussian_nll(target_labels, target_mu, target_log_sigma)
+                target_loss_for_chunk = target_loss[:, None]
+
+            loss = loss + self.force_target_loss_weight * target_loss_for_chunk
             if return_info:
                 info["loss_force_target_nll"] = jnp.mean(target_loss)
                 info["loss_force_target_weighted"] = self.force_target_loss_weight * jnp.mean(target_loss)
                 info.update(
                     self._force_distribution_info(
                         "force_target",
-                        observation.force_task_target,
-                        target_mu,
-                        target_log_sigma,
+                        target_labels,
+                        target_mu[:, None, :] if target_labels.ndim == 3 else target_mu,
+                        target_log_sigma[:, None, :] if target_labels.ndim == 3 else target_log_sigma,
                         target_loss,
                     )
                 )
