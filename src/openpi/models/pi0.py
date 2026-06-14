@@ -158,6 +158,51 @@ class Pi0(_model.BaseModel):
         nll = 0.5 * (jnp.square(target.astype(jnp.float32) - mu) * inv_var + 2.0 * log_sigma + _LOG_2PI)
         return jnp.mean(nll, axis=-1)
 
+    def _force_distribution_info(self, prefix, target, mu, log_sigma, nll):
+        target = jax.lax.stop_gradient(target.astype(jnp.float32))
+        mu = jax.lax.stop_gradient(mu)
+        log_sigma = jax.lax.stop_gradient(log_sigma)
+        nll = jax.lax.stop_gradient(nll)
+        residual = target - mu
+        pred_sigma = jnp.exp(log_sigma)
+        pred_var = jnp.square(pred_sigma)
+        reduce_axes = tuple(range(target.ndim - 1))
+
+        pred_sigma_axis = jnp.mean(pred_sigma, axis=reduce_axes)
+        pred_var_axis = jnp.mean(pred_var, axis=reduce_axes)
+        true_var_axis = jnp.var(target, axis=reduce_axes)
+        residual_mse_axis = jnp.mean(jnp.square(residual), axis=reduce_axes)
+        var_gap_axis = pred_var_axis - true_var_axis
+        true_std_axis = jnp.sqrt(true_var_axis + 1e-8)
+        residual_rmse_axis = jnp.sqrt(residual_mse_axis + 1e-8)
+
+        info = {
+            f"{prefix}_nll": jnp.mean(nll),
+            f"{prefix}_nll_negative_frac": jnp.mean((nll < 0.0).astype(jnp.float32)),
+            f"{prefix}_pred_log_sigma_mean": jnp.mean(log_sigma),
+            f"{prefix}_pred_log_sigma_min": jnp.min(log_sigma),
+            f"{prefix}_pred_log_sigma_max": jnp.max(log_sigma),
+            f"{prefix}_pred_log_sigma_min_clip_frac": jnp.mean((log_sigma <= -4.99).astype(jnp.float32)),
+            f"{prefix}_pred_log_sigma_max_clip_frac": jnp.mean((log_sigma >= 2.99).astype(jnp.float32)),
+            f"{prefix}_pred_sigma_mean": jnp.mean(pred_sigma),
+            f"{prefix}_pred_sigma_min": jnp.min(pred_sigma),
+            f"{prefix}_pred_sigma_max": jnp.max(pred_sigma),
+            f"{prefix}_pred_var_mean": jnp.mean(pred_var),
+            f"{prefix}_true_var_mean": jnp.mean(true_var_axis),
+            f"{prefix}_pred_var_minus_true_var_mean": jnp.mean(var_gap_axis),
+            f"{prefix}_pred_var_abs_gap_mean": jnp.mean(jnp.abs(var_gap_axis)),
+            f"{prefix}_residual_mse_mean": jnp.mean(residual_mse_axis),
+            f"{prefix}_pred_sigma_to_true_std_ratio_mean": jnp.mean(pred_sigma_axis / (true_std_axis + 1e-6)),
+            f"{prefix}_pred_var_to_residual_mse_ratio_mean": jnp.mean(pred_var_axis / (residual_mse_axis + 1e-6)),
+            f"{prefix}_residual_rmse_to_pred_sigma_ratio_mean": jnp.mean(residual_rmse_axis / (pred_sigma_axis + 1e-6)),
+        }
+        for axis in range(self.force_dim):
+            info[f"{prefix}_pred_var_axis_{axis}"] = pred_var_axis[axis]
+            info[f"{prefix}_true_var_axis_{axis}"] = true_var_axis[axis]
+            info[f"{prefix}_pred_var_minus_true_var_axis_{axis}"] = var_gap_axis[axis]
+            info[f"{prefix}_residual_mse_axis_{axis}"] = residual_mse_axis[axis]
+        return info
+
     def predict_force(
         self,
         observation: _model.Observation,
@@ -261,6 +306,23 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        loss, _ = self._compute_loss_and_info(rng, observation, actions, train=train, return_info=False)
+        return loss
+
+    def compute_loss_info(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ):
+        return self._compute_loss_and_info(rng, observation, actions, train=train, return_info=True)
+
+    def _compute_loss_and_info(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        return_info: bool = False,
+    ):
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -283,10 +345,12 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        fm_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        loss = fm_loss
+        info = {"loss_fm": jnp.mean(fm_loss)} if return_info else {}
 
         if not self.force_guidance:
-            return loss
+            return loss, info
 
         prefix_pooled = self._pool_prefix(prefix_out, prefix_mask)
 
@@ -294,13 +358,37 @@ class Pi0(_model.BaseModel):
             force_mu, force_log_sigma = self._predict_force(actions, observation, prefix_pooled)
             force_loss = self._diag_gaussian_nll(observation.force_targets, force_mu, force_log_sigma)
             loss = loss + self.force_loss_weight * force_loss
+            if return_info:
+                info["loss_force_nll"] = jnp.mean(force_loss)
+                info["loss_force_weighted"] = self.force_loss_weight * jnp.mean(force_loss)
+                info.update(
+                    self._force_distribution_info(
+                        "force",
+                        observation.force_targets,
+                        force_mu,
+                        force_log_sigma,
+                        force_loss,
+                    )
+                )
 
         if self.force_target_loss_weight > 0.0 and observation.force_task_target is not None:
             target_mu, target_log_sigma = self._predict_force_target(prefix_pooled)
             target_loss = self._diag_gaussian_nll(observation.force_task_target, target_mu, target_log_sigma)
             loss = loss + self.force_target_loss_weight * target_loss[:, None]
+            if return_info:
+                info["loss_force_target_nll"] = jnp.mean(target_loss)
+                info["loss_force_target_weighted"] = self.force_target_loss_weight * jnp.mean(target_loss)
+                info.update(
+                    self._force_distribution_info(
+                        "force_target",
+                        observation.force_task_target,
+                        target_mu,
+                        target_log_sigma,
+                        target_loss,
+                    )
+                )
 
-        return loss
+        return loss, info
 
     @override
     def sample_actions(

@@ -171,8 +171,8 @@ cd /root/autodl-tmp/openpi
 
 export OMP_NUM_THREADS=1
 export HF_LEROBOT_HOME=/root/autodl-tmp/data/force_vla_data/data_lerobot
-export HF_DATASETS_CACHE=/root/autodl-fs/openpi_cache/huggingface/datasets
-export HF_HOME=/root/autodl-fs/openpi_cache/huggingface
+export HF_DATASETS_CACHE=/root/autodl-fs/openpi_cache/hf_datasets
+export HF_HOME=/root/autodl-fs/openpi_cache/hf_home
 ```
 
 不建议把 `HF_DATASETS_CACHE` 放在 `/root/autodl-tmp`。LeRobot 会把 parquet 生成 Arrow cache，当前数据集生成过程已经在小盘上触发过 `No space left on device`。如果确认空间足够，才临时改回：
@@ -361,6 +361,64 @@ Guided sampling: lambda(tau) = 0.2 * sigmoid(1.0 * (tau - 6.0))
 
 训练监督里，`F_phi` 使用 action chunk 中每个示范动作对应的下一帧 force 作为标签；`force_task_target` 暂时用当前 action chunk 内下一帧 force 的均值作为任务级目标标签。
 
+### Force NLL / 方差诊断
+
+force-guided 训练会额外在日志 step 跑一次无梯度诊断前向，并把力预测分布指标写到 tqdm 和 wandb。训练反向仍只走原来的 `train_step`，诊断不进入梯度图。
+
+连续高斯 NLL 可以是负数，这本身不是数值错误。因为 NLL 里有 `log(sigma)` 项，当力标签已经归一化、预测残差很小、模型预测的 `sigma < 1` 时，`L_F_phi` 或 `L_target` 可以小于 0。需要判断的是方差是否坍塌。
+
+重点看这些指标：
+
+```text
+loss                 # 总训练 loss
+diagnostic_loss      # 同一 batch 的诊断总 loss
+loss_fm              # flow matching loss
+loss_force_nll       # F_phi 原始 NLL，未乘 0.05
+loss_force_weighted  # 0.05 * loss_force_nll
+loss_force_target_nll
+loss_force_target_weighted
+
+force_pred_log_sigma_mean/min/max
+force_pred_log_sigma_min_clip_frac
+force_pred_sigma_mean/min/max
+force_pred_var_mean
+force_true_var_mean
+force_pred_var_minus_true_var_mean
+force_pred_var_abs_gap_mean
+force_residual_mse_mean
+force_pred_sigma_to_true_std_ratio_mean
+force_pred_var_to_residual_mse_ratio_mean
+force_residual_rmse_to_pred_sigma_ratio_mean
+force_nll_negative_frac
+```
+
+每个力轴也会输出：
+
+```text
+force_pred_var_axis_0..5
+force_true_var_axis_0..5
+force_pred_var_minus_true_var_axis_0..5
+force_residual_mse_axis_0..5
+```
+
+判断方式：
+
+```text
+正常收敛:
+  force_residual_mse_mean 下降
+  force_pred_sigma_mean 随残差下降而下降
+  force_pred_log_sigma_min_clip_frac 接近 0
+
+疑似方差坍塌:
+  force_pred_log_sigma_min_clip_frac 长时间接近 1
+  force_pred_sigma_mean 非常小
+  force_pred_var_minus_true_var_mean 明显为负
+  force_residual_rmse_to_pred_sigma_ratio_mean 很大
+  loss_force_nll 很负但 residual_mse 没有同步变小
+```
+
+当前 `log_sigma` 在模型里裁剪到 `[-5, 3]`，所以最小 `sigma = exp(-5) ~= 0.0067`。如果 `force_pred_log_sigma_min_clip_frac` 很高，说明模型在持续顶到这个下界。
+
 ## 输出目录速查
 
 ### checkpoint
@@ -426,7 +484,7 @@ norm stats 在：
 按本文档设置后，HF / datasets 缓存写到：
 
 ```text
-/root/autodl-fs/openpi_cache/huggingface
+/root/autodl-fs/openpi_cache/hf_home
 ```
 
 openpi 预训练权重缓存当前实际写到：
@@ -516,8 +574,8 @@ target_eef_pose(6), target_gripper_width(1)
 ```bash
 export OMP_NUM_THREADS=1
 export HF_LEROBOT_HOME=/root/autodl-tmp/data/force_vla_data/data_lerobot
-export HF_DATASETS_CACHE=/root/autodl-fs/openpi_cache/huggingface/datasets
-export HF_HOME=/root/autodl-fs/openpi_cache/huggingface
+export HF_DATASETS_CACHE=/root/autodl-fs/openpi_cache/hf_datasets
+export HF_HOME=/root/autodl-fs/openpi_cache/hf_home
 
 uv run python - <<'PY'
 from openpi.training import config as _config
@@ -550,8 +608,8 @@ prompt (16, 48) (16, 48)
 ```bash
 export OMP_NUM_THREADS=1
 export HF_LEROBOT_HOME=/root/autodl-tmp/data/force_vla_data/data_lerobot
-export HF_DATASETS_CACHE=/root/autodl-fs/openpi_cache/huggingface/datasets
-export HF_HOME=/root/autodl-fs/openpi_cache/huggingface
+export HF_DATASETS_CACHE=/root/autodl-fs/openpi_cache/hf_datasets
+export HF_HOME=/root/autodl-fs/openpi_cache/hf_home
 
 uv run python - <<'PY'
 from openpi.training import config as _config

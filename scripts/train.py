@@ -191,6 +191,31 @@ def train_step(
     return new_state, info
 
 
+@at.typecheck
+def diagnostic_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> dict[str, at.Array]:
+    del config
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+
+    diagnostic_rng = jax.random.fold_in(rng, state.step + 10_000_000)
+    observation, actions = batch
+
+    if hasattr(model, "compute_loss_info"):
+        chunked_loss, model_info = model.compute_loss_info(diagnostic_rng, observation, actions, train=False)
+    else:
+        chunked_loss = model.compute_loss(diagnostic_rng, observation, actions, train=False)
+        model_info = {}
+
+    info = {"diagnostic_loss": jnp.mean(chunked_loss)}
+    info.update(model_info)
+    return info
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -246,6 +271,12 @@ def main(config: _config.TrainConfig):
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+    pdiagnostic_step = jax.jit(
+        functools.partial(diagnostic_step, config),
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        out_shardings=replicated_sharding,
+    )
+    log_force_diagnostics = bool(getattr(config.model, "force_guidance", False))
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -263,6 +294,10 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            if log_force_diagnostics:
+                with sharding.set_mesh(mesh):
+                    diagnostic_info = pdiagnostic_step(train_rng, train_state, batch)
+                reduced_info.update(jax.device_get(jax.tree.map(jnp.mean, diagnostic_info)))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
