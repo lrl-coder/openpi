@@ -2,6 +2,7 @@ import dataclasses
 from typing import ClassVar
 
 import jax
+import torch
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
@@ -17,6 +18,22 @@ class _FakeLeRobotMetadata:
 def test_episodes_from_lerobot_split():
     assert _data_loader._episodes_from_lerobot_split(_FakeLeRobotMetadata(), "train") == list(range(40))  # noqa: SLF001
     assert _data_loader._episodes_from_lerobot_split(_FakeLeRobotMetadata(), "test") == list(range(40, 50))  # noqa: SLF001
+
+
+def test_patch_lerobot_episode_data_index_for_nonzero_episode_ids():
+    class FakeDataset:
+        def __init__(self):
+            self.episodes = list(range(40, 50))
+            self.episode_data_index = {
+                "from": torch.arange(0, 100, 10),
+                "to": torch.arange(10, 110, 10),
+            }
+
+    dataset = FakeDataset()
+    _data_loader._patch_lerobot_episode_data_index(dataset)  # noqa: SLF001
+
+    assert dataset.episode_data_index["from"][40] == 0
+    assert dataset.episode_data_index["to"][49] == 100
 
 
 def test_torch_data_loader():

@@ -59,6 +59,22 @@ def _episodes_from_lerobot_split(dataset_meta: lerobot_dataset.LeRobotDatasetMet
     return episodes
 
 
+def _patch_lerobot_episode_data_index(dataset: lerobot_dataset.LeRobotDataset) -> None:
+    """Allows LeRobot delta queries to work when selected episode ids do not start at zero."""
+    if dataset.episodes is None or not dataset.episodes:
+        return
+    if max(dataset.episodes) < len(dataset.episode_data_index["from"]):
+        return
+
+    index_size = max(dataset.episodes) + 1
+    patched_index = {}
+    for key, values in dataset.episode_data_index.items():
+        patched_values = torch.empty(index_size, dtype=values.dtype)
+        patched_values[dataset.episodes] = values
+        patched_index[key] = patched_values
+    dataset.episode_data_index = patched_index
+
+
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 
@@ -203,6 +219,7 @@ def create_torch_dataset(
         episodes=episodes,
         delta_timestamps=delta_timestamps,
     )
+    _patch_lerobot_episode_data_index(dataset)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
