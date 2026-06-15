@@ -1,10 +1,22 @@
 import dataclasses
+from typing import ClassVar
 
 import jax
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+
+
+class _FakeLeRobotMetadata:
+    repo_id = "fake/repo"
+    total_episodes = 50
+    info: ClassVar[dict] = {"splits": {"train": "0:40", "test": "40:50"}}
+
+
+def test_episodes_from_lerobot_split():
+    assert _data_loader._episodes_from_lerobot_split(_FakeLeRobotMetadata(), "train") == list(range(40))  # noqa: SLF001
+    assert _data_loader._episodes_from_lerobot_split(_FakeLeRobotMetadata(), "test") == list(range(40, 50))  # noqa: SLF001
 
 
 def test_torch_data_loader():

@@ -22,6 +22,23 @@ pi0_flexiv_pump_1bottle_inputForce_with_force_guided
 推荐优先使用 `pi0_flexiv_pump_1bottle_inputForce_lora`。openpi README 中给出的显存参考是：LoRA 微调约需要 22.5GB 以上显存，全量微调约需要 70GB 以上显存。
 如果要训练新增 CST/力预测/语义力目标方案，优先使用 `pi0_flexiv_pump_1bottle_inputForce_lora_force_guided`。
 
+## 训练/测试集划分
+
+当前本地数据集共 50 个 episode，已经在下面这个文件中按 8:2 划分：
+
+```text
+/root/autodl-tmp/data/force_vla_data/data_lerobot/flexiv_pump_1bottle_inputForce/meta/info.json
+```
+
+```json
+"splits": {
+    "train": "0:40",
+    "test": "40:50"
+}
+```
+
+Flexiv pump 相关训练配置默认只使用 `train` split。训练时还会每隔 `log_interval` step 在 `test` split 上跑 `eval_num_batches` 个 batch，并把指标写到 wandb 和 checkpoint 目录的 `metrics.csv`。默认 `eval_num_batches=1`，可以在训练命令后加 `--eval-num-batches=4` 等参数提高测试指标稳定性。
+
 ## 训练配置在哪里看
 
 主要看这个文件：
@@ -89,10 +106,12 @@ log_interval        = 100
 save_interval       = 1000
 keep_period         = 5000
 wandb_enabled       = True
+eval_split          = test
+eval_num_batches    = 1
 fsdp_devices        = 1
 ```
 
-也就是说，默认每 100 step 打印/记录一次日志，每 1000 step 保存一次 checkpoint，且每 5000 step 的 checkpoint 会被保留。终端只打印核心摘要，完整 scalar 指标会写入 checkpoint 目录下的 `metrics.csv`，同时继续写入 wandb。
+也就是说，默认每 100 step 打印/记录一次训练和测试日志，每 1000 step 保存一次 checkpoint，且每 5000 step 的 checkpoint 会被保留。终端只打印核心摘要，完整 scalar 指标会写入 checkpoint 目录下的 `metrics.csv`，同时继续写入 wandb。测试集 loss 会以 `test/loss` 记录；force-guided 配置还会记录 `test/loss_fm`、`test/loss_force_nll`、`test/loss_force_target_nll` 等诊断项。
 
 如果想临时覆盖配置，不一定要改代码，可以在训练命令后加参数。例如只训练 5000 step、关闭 wandb：
 

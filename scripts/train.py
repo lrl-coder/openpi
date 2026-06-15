@@ -29,15 +29,22 @@ import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
-
 _CONSOLE_LOG_KEYS = (
     "loss",
+    "test/loss",
     "grad_norm",
     "param_norm",
     "diagnostic_loss",
     "loss_fm",
     "force_nll",
+    "loss_force_nll",
     "force_target_nll",
+    "loss_force_target_nll",
+    "test/loss_fm",
+    "test/force_nll",
+    "test/loss_force_nll",
+    "test/force_target_nll",
+    "test/loss_force_target_nll",
 )
 
 
@@ -88,9 +95,9 @@ def _scalar_metric_value(value: Any) -> float | int | str:
     array = np.asarray(value)
     if array.shape == ():
         item = array.item()
-        if isinstance(item, (np.integer, int)):
+        if isinstance(item, np.integer | int):
             return int(item)
-        if isinstance(item, (np.floating, float)):
+        if isinstance(item, np.floating | float):
             return float(item)
         return str(item)
     return str(array.tolist())
@@ -103,6 +110,14 @@ def _format_metric_summary(metrics: dict[str, Any]) -> str:
     return ", ".join(f"{key}={float(np.asarray(metrics[key])):.4f}" for key in keys)
 
 
+def _prefix_eval_metrics(metrics: dict[str, Any], split: str) -> dict[str, Any]:
+    prefixed = {}
+    for key, value in metrics.items():
+        metric_key = "loss" if key == "diagnostic_loss" else key
+        prefixed[f"{split}/{metric_key}"] = value
+    return prefixed
+
+
 class CsvMetricLogger:
     """Writes scalar training metrics to CSV while allowing new columns over time."""
 
@@ -113,7 +128,7 @@ class CsvMetricLogger:
         self.rows: list[dict[str, Any]] = []
 
         if resume and self.path.exists():
-            with open(self.path, "r", newline="") as f:
+            with open(self.path, newline="") as f:
                 reader = csv.DictReader(f)
                 self.fieldnames = list(reader.fieldnames or self.fieldnames)
                 self.rows = list(reader)
@@ -327,6 +342,17 @@ def main(config: _config.TrainConfig):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
+    eval_iter = None
+    if config.eval_split is not None:
+        eval_data_loader = _data_loader.create_data_loader(
+            config,
+            sharding=data_sharding,
+            shuffle=False,
+            split=config.eval_split,
+        )
+        eval_iter = iter(eval_data_loader)
+        logging.info("Initialized %s eval data loader", config.eval_split)
+
     # Log images from first batch to sanity check.
     images_to_log = [
         wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
@@ -376,6 +402,15 @@ def main(config: _config.TrainConfig):
                 with sharding.set_mesh(mesh):
                     diagnostic_info = pdiagnostic_step(train_rng, train_state, batch)
                 reduced_info.update(jax.device_get(jax.tree.map(jnp.mean, diagnostic_info)))
+            if eval_iter is not None:
+                eval_infos = []
+                for _ in range(config.eval_num_batches):
+                    eval_batch = next(eval_iter)
+                    with sharding.set_mesh(mesh):
+                        eval_infos.append(pdiagnostic_step(train_rng, train_state, eval_batch))
+                stacked_eval_infos = common_utils.stack_forest(eval_infos)
+                eval_info = jax.device_get(jax.tree.map(jnp.mean, stacked_eval_infos))
+                reduced_info.update(_prefix_eval_metrics(eval_info, config.eval_split))
             csv_metric_logger.write(step, reduced_info)
             pbar.write(f"Step {step}: {_format_metric_summary(reduced_info)}")
             wandb.log(reduced_info, step=step)

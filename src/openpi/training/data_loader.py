@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import dataclasses
 import logging
 import multiprocessing
 import os
@@ -17,6 +18,45 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+
+
+def _episodes_from_lerobot_split(dataset_meta: lerobot_dataset.LeRobotDatasetMetadata, split: str) -> list[int]:
+    """Returns episode indices for a LeRobot split defined as "start:end" in meta/info.json."""
+    splits = dataset_meta.info.get("splits", {})
+    if split not in splits:
+        available = ", ".join(sorted(splits)) or "<none>"
+        raise ValueError(
+            f"LeRobot split {split!r} was requested for {dataset_meta.repo_id}, "
+            f"but meta/info.json only defines: {available}."
+        )
+
+    split_value = splits[split]
+    if not isinstance(split_value, str) or ":" not in split_value:
+        raise ValueError(
+            f"Unsupported LeRobot split value for {dataset_meta.repo_id}:{split}: {split_value!r}. "
+            "Expected a value like '0:40'."
+        )
+
+    start_str, end_str = split_value.split(":", maxsplit=1)
+    try:
+        start = 0 if start_str == "" else int(start_str)
+        end = dataset_meta.total_episodes if end_str == "" else int(end_str)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid LeRobot split value for {dataset_meta.repo_id}:{split}: {split_value!r}."
+        ) from exc
+
+    if start < 0 or end < start or end > dataset_meta.total_episodes:
+        raise ValueError(
+            f"Invalid LeRobot split range for {dataset_meta.repo_id}:{split}: {split_value!r}; "
+            f"dataset has {dataset_meta.total_episodes} episodes."
+        )
+
+    episodes = list(range(start, end))
+    if not episodes:
+        raise ValueError(f"LeRobot split {dataset_meta.repo_id}:{split} is empty ({split_value!r}).")
+
+    return episodes
 
 
 class Dataset(Protocol[T_co]):
@@ -147,8 +187,20 @@ def create_torch_dataset(
             for key, steps in data_config.extra_delta_timestamp_steps.items()
         }
     )
+    episodes = None
+    if data_config.split is not None:
+        episodes = _episodes_from_lerobot_split(dataset_meta, data_config.split)
+        logging.info(
+            "Using LeRobot split %s=%s for %s (%d episodes)",
+            data_config.split,
+            dataset_meta.info["splits"][data_config.split],
+            repo_id,
+            len(episodes),
+        )
+
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        episodes=episodes,
         delta_timestamps=delta_timestamps,
     )
 
@@ -235,6 +287,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    split: str | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -245,8 +298,11 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
+        split: Optional LeRobot split override.
     """
     data_config = config.data.create(config.assets_dirs, config.model)
+    if split is not None:
+        data_config = dataclasses.replace(data_config, split=split)
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:

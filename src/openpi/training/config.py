@@ -175,6 +175,8 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional LeRobot split name. If set, the loader will only use episodes from meta/info.json["splits"][split].
+    split: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -618,6 +620,7 @@ def _flexiv_pump_data_config(
             ],
         ),
         base_config=DataConfig(
+            split="train",
             prompt_from_task=True,
             action_sequence_keys=("action",),
             extra_delta_timestamp_steps={
@@ -693,6 +696,10 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
+    # Optional LeRobot split to evaluate and log to wandb/metrics.csv during training.
+    eval_split: str | None = None
+    # Number of eval batches to average each time metrics are logged.
+    eval_num_batches: int = 1
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -735,6 +742,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.eval_split is not None and self.eval_num_batches <= 0:
+            raise ValueError("eval_num_batches must be greater than 0 when eval_split is set.")
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -885,6 +894,7 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=16,
         num_workers=0,
+        eval_split="test",
         checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
         freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
@@ -899,6 +909,7 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=16,
         num_workers=0,
+        eval_split="test",
         checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
         freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
@@ -925,6 +936,7 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=16,
         num_workers=0,
+        eval_split="test",
         checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
         freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora",
@@ -954,6 +966,7 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=16,
         num_workers=0,
+        eval_split="test",
         checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
         freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora",
@@ -970,6 +983,7 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=16,
         num_workers=0,
+        eval_split="test",
         checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
     ),
     TrainConfig(
@@ -980,6 +994,7 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=16,
         num_workers=0,
+        eval_split="test",
         checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
     ),
     TrainConfig(
@@ -1000,6 +1015,7 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=16,
         num_workers=0,
+        eval_split="test",
         checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
     ),
     TrainConfig(
@@ -1021,6 +1037,7 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=16,
         num_workers=0,
+        eval_split="test",
         checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
     ),
     TrainConfig(
