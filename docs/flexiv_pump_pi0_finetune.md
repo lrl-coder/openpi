@@ -74,7 +74,7 @@ force-guided 配置额外设置：
 ```text
 model.force_guidance             = True
 model.force_loss_weight          = 0.05
-model.force_target_loss_weight   = 0.01
+model.force_target_loss_weight   = 0.01  # 当前作为 semantic-force query 对齐 loss 权重
 model.force_guidance_lambda_max  = 0.2
 model.force_guidance_k           = 1.0
 model.force_guidance_tau0        = 6.0
@@ -111,7 +111,7 @@ eval_num_batches    = 1
 fsdp_devices        = 1
 ```
 
-也就是说，默认每 100 step 打印/记录一次训练和测试日志，每 1000 step 保存一次 checkpoint，且每 5000 step 的 checkpoint 会被保留。终端只打印核心摘要，完整 scalar 指标会写入 checkpoint 目录下的 `metrics.csv`，同时继续写入 wandb。测试集 loss 会以 `test/loss` 记录；force-guided 配置还会记录 `test/loss_fm`、`test/loss_force_nll`、`test/loss_force_target_nll` 等诊断项。
+也就是说，默认每 100 step 打印/记录一次训练和测试日志，每 1000 step 保存一次 checkpoint，且每 5000 step 的 checkpoint 会被保留。终端只打印核心摘要，完整 scalar 指标会写入 checkpoint 目录下的 `metrics.csv`，同时继续写入 wandb。测试集 loss 会以 `test/loss` 记录；force-guided 配置还会记录 `test/loss_fm`、`test/loss_force_nll`、`test/loss_force_semantic_align` 等诊断项。
 
 如果想临时覆盖配置，不一定要改代码，可以在训练命令后加参数。例如只训练 5000 step、关闭 wandb：
 
@@ -384,29 +384,29 @@ uv run scripts/train.py pi0_flexiv_pump_1bottle_inputForce_lora_force_guided \
 ```text
 force_history_global: 64 x 6, 对应当前帧及过去 63 帧，用于全局接触上下文
 force_history_local: 16 x 6, 对应当前帧及过去 15 帧，用于局部接触动态
-VLM global path: force_history_global -> 8 个 force patch tokens -> VLM prefix
+VLM semantic path: learnable semantic-force query token -> 与 image/language prefix 双向交互
+Force teacher path: force_history_global -> causal dilated Conv1D -> actual force feature
 Action local path: force_history_local -> causal dilated Conv1D -> force condition token -> action suffix
-VLM semantic force target head: C_pool(image, language, force tokens) -> (mu*, log_sigma*)
 Action auxiliary force predictor F_phi: action-head hidden features -> (mu_f, log_sigma_f)
-Training loss: L = L_FM + 0.05 * L_F_phi + 0.01 * L_target
+Training loss: L = L_FM + 0.05 * L_F_phi + 0.01 * L_semantic_align
 Policy CST: tau = sum((f_t - mu_{f,t-1})^2 / sigma_{f,t-1}^2)
-Guided sampling: lambda(tau) = 0.2 * sigmoid(1.0 * (tau - 6.0))
+Guided sampling: lambda(tau) = 0.2 * sigmoid(1.0 * (tau - 6.0)), target force 默认使用当前真实测量力
 ```
 
 训练监督里，`F_phi` 不再是独立拼接 MLP；它挂在原动作头的 action-token hidden features 后面，只做数值解码。标签仍使用 action chunk 中每个示范动作对应的下一帧 force。
-VLM semantic force target head 的 `L_target` 当前优先使用整段 `force_targets` 作为 NLL 目标，而不是单点 `force_task_target`。也就是说，`(mu*, sigma*)` 对 `(B, 50, 6)` 的力序列广播，监督目标是 chunk 内力分布：
+语义力目标不再把历史力作为 VLM prefix token，也不再训练未来力预测头。当前做法是在 VLM prefix 前插入一个 learnable semantic-force query token；该 token 只和图像、语言交互，输出 query feature。真实历史力 `force_history_global(64, 6)` 只进入训练期 force teacher encoder，得到 actual force feature。两者用 cosine alignment 对齐：
 
 ```text
-L_target = mean_t NLL(force_targets[:, t, :] ; mu*, sigma*)
+L_semantic_align = 1 - cosine(z_query, z_force)
 ```
 
-这样 `sigma*` 的最优解对应 force 序列的经验方差，而不是 `mu*` 对单点均值的预测残差方差。只有当 `force_targets` 不存在时，代码才会回退到 legacy 的 `force_task_target` 单点监督。
+推理时 semantic-force query 仍保留在 VLM prefix 中，但不需要 `force_history_global` 参与 VLM。CST 引导默认使用当前真实测量力作为 guidance target；`force_target_mu/log_sigma` 仍可通过 `sample_actions` 显式覆盖。
 
 ### Force NLL / 方差诊断
 
 force-guided 训练会额外在日志 step 跑一次无梯度诊断前向，并把力预测分布指标写到 checkpoint 目录下的 `metrics.csv` 和 wandb。终端 tqdm 只显示核心摘要，训练反向仍只走原来的 `train_step`，诊断不进入梯度图。
 
-连续高斯 NLL 可以是负数，这本身不是数值错误。因为 NLL 里有 `log(sigma)` 项，当力标签已经归一化、预测残差很小、模型预测的 `sigma < 1` 时，`L_F_phi` 或 `L_target` 可以小于 0。需要判断的是方差是否坍塌。旧版本曾用 `force_task_target` 单点均值监督 `L_target`，这会让 `sigma*` 学到均值预测残差而不是示范力分布方差；现在已经改为优先用整段 `force_targets` 监督。
+连续高斯 NLL 可以是负数，这本身不是数值错误。因为 NLL 里有 `log(sigma)` 项，当力标签已经归一化、预测残差很小、模型预测的 `sigma < 1` 时，`L_F_phi` 可以小于 0。需要判断的是方差是否坍塌。语义力目标当前不是 NLL，而是 semantic-force query feature 和真实历史力 feature 的 cosine alignment。
 
 重点看这些指标：
 
@@ -416,8 +416,9 @@ diagnostic_loss      # 同一 batch 的诊断总 loss
 loss_fm              # flow matching loss
 loss_force_nll       # F_phi 原始 NLL，未乘 0.05
 loss_force_weighted  # 0.05 * loss_force_nll
-loss_force_target_nll
-loss_force_target_weighted
+loss_force_semantic_align
+loss_force_semantic_align_weighted
+force_semantic_cosine_mean
 
 force_pred_log_sigma_mean/min/max
 force_pred_log_sigma_min_clip_frac
@@ -440,8 +441,6 @@ force_pred_var_axis_0..5
 force_true_var_axis_0..5
 force_pred_var_minus_true_var_axis_0..5
 force_residual_mse_axis_0..5
-force_target_true_var_within_horizon_axis_0..5
-force_target_pred_var_minus_true_var_within_horizon_axis_0..5
 ```
 
 判断方式：
@@ -550,13 +549,13 @@ openpi 预训练权重缓存当前实际写到：
 /root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora_force_guided/flexiv_pump_lora_force_guided/metrics.csv
 ```
 
-终端只会打印短摘要，例如 `loss`, `grad_norm`, `diagnostic_loss`, `loss_fm`, `force_nll`, `force_target_nll`。完整的 `force_pred_*`, `force_target_*` 方差诊断都在 CSV 里，后续可以直接用 pandas 分析：
+终端只会打印短摘要，例如 `loss`, `grad_norm`, `diagnostic_loss`, `loss_fm`, `loss_force_nll`, `loss_force_semantic_align`, `force_semantic_cosine_mean`。完整的 `force_pred_*` 方差诊断和 semantic-force 对齐指标都在 CSV 里，后续可以直接用 pandas 分析：
 
 ```python
 import pandas as pd
 
 df = pd.read_csv("/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora_force_guided/flexiv_pump_lora_force_guided/metrics.csv")
-print(df[["step", "loss", "force_nll", "force_target_nll", "force_pred_sigma_mean"]].tail())
+print(df[["step", "loss", "loss_force_nll", "loss_force_semantic_align", "force_semantic_cosine_mean"]].tail())
 ```
 
 ### wandb

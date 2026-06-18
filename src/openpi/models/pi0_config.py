@@ -42,7 +42,9 @@ class Pi0Config(_model.BaseModelConfig):
     # Local force history is a shorter contact context for immediate action conditioning.
     force_history_local_len: int = 16
     force_global_patch_size: int = 8
+    force_semantic_feature_dim: int = 256
     force_loss_weight: float = 0.0
+    # Weight for semantic force query alignment. The name is kept for CLI/checkpoint config compatibility.
     force_target_loss_weight: float = 0.0
     force_guidance_lambda_max: float = 0.0
     force_guidance_k: float = 1.0

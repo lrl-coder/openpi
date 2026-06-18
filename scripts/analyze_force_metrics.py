@@ -35,6 +35,9 @@ KEY_METRICS = [
     "force_target_nll",
     "loss_force_weighted",
     "loss_force_target_weighted",
+    "loss_force_semantic_align",
+    "loss_force_semantic_align_weighted",
+    "force_semantic_cosine_mean",
     "grad_norm",
     "force_pred_sigma_mean",
     "force_pred_sigma_to_true_std_ratio_mean",
@@ -57,6 +60,7 @@ PLOT_GROUPS = {
         "loss_fm",
         "loss_force_weighted",
         "loss_force_target_weighted",
+        "loss_force_semantic_align_weighted",
     ],
     "force_nll": [
         "force_nll",

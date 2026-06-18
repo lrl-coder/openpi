@@ -40,11 +40,15 @@ _CONSOLE_LOG_KEYS = (
     "loss_force_nll",
     "force_target_nll",
     "loss_force_target_nll",
+    "loss_force_semantic_align",
+    "force_semantic_cosine_mean",
     "test/loss_fm",
     "test/force_nll",
     "test/loss_force_nll",
     "test/force_target_nll",
     "test/loss_force_target_nll",
+    "test/loss_force_semantic_align",
+    "test/force_semantic_cosine_mean",
 )
 
 

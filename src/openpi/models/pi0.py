@@ -120,10 +120,32 @@ class Pi0(_model.BaseModel):
             )
             self.force_predictor_in = nnx.Linear(force_predictor_input_dim, action_expert_config.width, rngs=rngs)
             self.force_predictor_out = nnx.Linear(action_expert_config.width, 2 * config.force_dim, rngs=rngs)
-            force_global_patch_dim = self.force_global_patch_size * config.force_dim
-            self.force_global_patch_proj = nnx.Linear(force_global_patch_dim, paligemma_config.width, rngs=rngs)
-            self.force_global_pos_embedding = nnx.Param(
-                jnp.zeros((self.force_num_global_tokens, paligemma_config.width), dtype=jnp.float32)
+
+            self.force_semantic_query = nnx.Param(
+                0.02 * jax.random.normal(rngs.params(), (1, paligemma_config.width), dtype=jnp.float32)
+            )
+            self.force_semantic_query_proj = nnx.Linear(
+                paligemma_config.width, config.force_semantic_feature_dim, rngs=rngs
+            )
+            self.force_semantic_conv1 = nnx.Conv(
+                config.force_dim, 64, kernel_size=5, padding="CAUSAL", rngs=rngs
+            )
+            self.force_semantic_norm1 = nnx.LayerNorm(64, rngs=rngs)
+            self.force_semantic_conv2 = nnx.Conv(
+                64, 128, kernel_size=3, padding="CAUSAL", kernel_dilation=2, rngs=rngs
+            )
+            self.force_semantic_norm2 = nnx.LayerNorm(128, rngs=rngs)
+            self.force_semantic_conv3 = nnx.Conv(
+                128,
+                config.force_semantic_feature_dim,
+                kernel_size=3,
+                padding="CAUSAL",
+                kernel_dilation=4,
+                rngs=rngs,
+            )
+            self.force_semantic_norm3 = nnx.LayerNorm(config.force_semantic_feature_dim, rngs=rngs)
+            self.force_semantic_out = nnx.Linear(
+                config.force_semantic_feature_dim, config.force_semantic_feature_dim, rngs=rngs
             )
             self.force_local_conv1 = nnx.Conv(
                 config.force_dim, 64, kernel_size=3, padding="CAUSAL", rngs=rngs
@@ -143,20 +165,13 @@ class Pi0(_model.BaseModel):
             )
             self.force_local_norm3 = nnx.LayerNorm(action_expert_config.width, rngs=rngs)
             self.force_local_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-            self.force_target_in = nnx.Linear(paligemma_config.width, action_expert_config.width, rngs=rngs)
-            self.force_target_out = nnx.Linear(action_expert_config.width, 2 * config.force_dim, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
-    @property
-    def force_num_global_tokens(self) -> int:
-        return math.ceil(self.force_history_global_len / self.force_global_patch_size)
-
-    def _pool_prefix(self, prefix_out, prefix_mask):
-        mask = prefix_mask.astype(prefix_out.dtype)[..., None]
-        denom = jnp.maximum(jnp.sum(mask, axis=1), 1.0)
-        return jnp.sum(prefix_out * mask, axis=1) / denom
+    def _l2_normalize(self, x, eps: float = 1e-6):
+        x = x.astype(jnp.float32)
+        return x * jax.lax.rsqrt(jnp.sum(jnp.square(x), axis=-1, keepdims=True) + eps)
 
     def _force_history_or_current(self, obs: _model.Observation, dtype, *, scope: str):
         batch_size = obs.state.shape[0]
@@ -186,20 +201,36 @@ class Pi0(_model.BaseModel):
             force_history = force_history[:, -target_len:, :]
         return force_history
 
-    def _embed_force_global_tokens(self, obs: _model.Observation, dtype):
+    def _embed_semantic_force_query(self, batch_size: int, dtype):
+        query = self.force_semantic_query.value.astype(dtype)
+        return jnp.broadcast_to(query[None, :, :], (batch_size, query.shape[0], query.shape[1]))
+
+    def _encode_force_semantic_feature(self, obs: _model.Observation, dtype):
         force_history = self._force_history_or_current(obs, dtype, scope="global")
-        pad_len = self.force_num_global_tokens * self.force_global_patch_size - self.force_history_global_len
-        if pad_len > 0:
-            force_history = jnp.pad(force_history, ((0, 0), (pad_len, 0), (0, 0)))
-        patches = einops.rearrange(
-            force_history,
-            "b (n p) f -> b n (p f)",
-            n=self.force_num_global_tokens,
-            p=self.force_global_patch_size,
-        )
-        tokens = self.force_global_patch_proj(patches)
-        pos = self.force_global_pos_embedding.value.astype(tokens.dtype)
-        return tokens + pos[None, :, :]
+        hidden = self.force_semantic_conv1(force_history)
+        hidden = self.force_semantic_norm1(hidden)
+        hidden = nnx.swish(hidden)
+        hidden = self.force_semantic_conv2(hidden)
+        hidden = self.force_semantic_norm2(hidden)
+        hidden = nnx.swish(hidden)
+        hidden = self.force_semantic_conv3(hidden)
+        hidden = self.force_semantic_norm3(hidden)
+        hidden = nnx.swish(hidden)
+        pooled = jnp.mean(hidden, axis=1)
+        feature = self.force_semantic_out(pooled)
+        return self._l2_normalize(feature)
+
+    def _semantic_force_query_feature(self, prefix_out):
+        query_hidden = prefix_out[:, 0, :]
+        query_feature = self.force_semantic_query_proj(query_hidden)
+        return self._l2_normalize(query_feature)
+
+    def _semantic_force_alignment_loss(self, obs: _model.Observation, prefix_out):
+        query_feature = self._semantic_force_query_feature(prefix_out)
+        force_feature = self._encode_force_semantic_feature(obs, prefix_out.dtype)
+        cosine = jnp.sum(query_feature * force_feature, axis=-1)
+        loss = 1.0 - cosine
+        return loss, cosine
 
     def _embed_force_local_token(self, obs: _model.Observation, dtype):
         force_history = self._force_history_or_current(obs, dtype, scope="local")
@@ -220,11 +251,6 @@ class Pi0(_model.BaseModel):
     def _split_force_distribution(self, x):
         mu, log_sigma = jnp.split(x.astype(jnp.float32), 2, axis=-1)
         return mu, jnp.clip(log_sigma, -5.0, 3.0)
-
-    def _predict_force_target(self, prefix_pooled):
-        hidden = self.force_target_in(prefix_pooled)
-        hidden = nnx.swish(hidden)
-        return self._split_force_distribution(self.force_target_out(hidden))
 
     def _decode_force_from_action_features(self, action_features):
         return self._split_force_distribution(self.force_predictor_out(action_features))
@@ -277,6 +303,17 @@ class Pi0(_model.BaseModel):
         inv_var = jnp.exp(-2.0 * log_sigma)
         nll = 0.5 * (jnp.square(target.astype(jnp.float32) - mu) * inv_var + 2.0 * log_sigma + _LOG_2PI)
         return jnp.mean(nll, axis=-1)
+
+    def _current_real_force(self, obs: _model.Observation, dtype):
+        if obs.force is not None:
+            return obs.force.astype(dtype)
+        if obs.force_history_local is not None:
+            return obs.force_history_local[:, -1, :].astype(dtype)
+        if obs.force_history is not None:
+            return obs.force_history[:, -1, :].astype(dtype)
+        if obs.force_history_global is not None:
+            return obs.force_history_global[:, -1, :].astype(dtype)
+        return None
 
     def _force_distribution_info(self, prefix, target, mu, log_sigma, nll):
         target = jax.lax.stop_gradient(target.astype(jnp.float32))
@@ -355,11 +392,11 @@ class Pi0(_model.BaseModel):
         ar_mask = []
         tokens = []
         if self.force_guidance:
-            force_tokens = self._embed_force_global_tokens(obs, next(iter(obs.images.values())).dtype)
-            tokens.append(force_tokens)
-            input_mask.append(jnp.ones(force_tokens.shape[:2], dtype=jnp.bool_))
-            # Global force history tokens are observed context and can attend bidirectionally with image/language prefix tokens.
-            ar_mask += [False] * force_tokens.shape[1]
+            query_token = self._embed_semantic_force_query(obs.state.shape[0], next(iter(obs.images.values())).dtype)
+            tokens.append(query_token)
+            input_mask.append(jnp.ones(query_token.shape[:2], dtype=jnp.bool_))
+            # The semantic-force query is not a force observation; it gathers image-language contact context.
+            ar_mask += [False] * query_token.shape[1]
 
         # embed images
         for name in obs.images:
@@ -492,8 +529,6 @@ class Pi0(_model.BaseModel):
         if not self.force_guidance:
             return loss, info
 
-        prefix_pooled = self._pool_prefix(prefix_out, prefix_mask)
-
         if self.force_loss_weight > 0.0 and observation.force_targets is not None:
             force_mu, force_log_sigma = self._predict_force_from_action_head(
                 observation, actions, prefix_mask, kv_cache
@@ -513,36 +548,13 @@ class Pi0(_model.BaseModel):
                     )
                 )
 
-        if self.force_target_loss_weight > 0.0 and (
-            observation.force_targets is not None or observation.force_task_target is not None
-        ):
-            target_mu, target_log_sigma = self._predict_force_target(prefix_pooled)
-            if observation.force_targets is not None:
-                target_labels = observation.force_targets
-                target_loss = self._diag_gaussian_nll(
-                    target_labels,
-                    target_mu[:, None, :],
-                    target_log_sigma[:, None, :],
-                )
-                target_loss_for_chunk = target_loss
-            else:
-                target_labels = observation.force_task_target
-                target_loss = self._diag_gaussian_nll(target_labels, target_mu, target_log_sigma)
-                target_loss_for_chunk = target_loss[:, None]
-
-            loss = loss + self.force_target_loss_weight * target_loss_for_chunk
+        if self.force_target_loss_weight > 0.0:
+            semantic_loss, semantic_cosine = self._semantic_force_alignment_loss(observation, prefix_out)
+            loss = loss + self.force_target_loss_weight * semantic_loss[:, None]
             if return_info:
-                info["loss_force_target_nll"] = jnp.mean(target_loss)
-                info["loss_force_target_weighted"] = self.force_target_loss_weight * jnp.mean(target_loss)
-                info.update(
-                    self._force_distribution_info(
-                        "force_target",
-                        target_labels,
-                        target_mu[:, None, :] if target_labels.ndim == 3 else target_mu,
-                        target_log_sigma[:, None, :] if target_labels.ndim == 3 else target_log_sigma,
-                        target_loss,
-                    )
-                )
+                info["loss_force_semantic_align"] = jnp.mean(semantic_loss)
+                info["loss_force_semantic_align_weighted"] = self.force_target_loss_weight * jnp.mean(semantic_loss)
+                info["force_semantic_cosine_mean"] = jnp.mean(semantic_cosine)
 
         return loss, info
 
@@ -571,7 +583,7 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (cached_prefix_out, _), kv_cache = self.PaliGemma.llm(
+        (_, _), kv_cache = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
 
@@ -579,15 +591,11 @@ class Pi0(_model.BaseModel):
             cst_tau is not None or force_guidance_lambda is not None
         )
         if enable_force_guidance:
-            prefix_pooled = self._pool_prefix(cached_prefix_out, prefix_mask)
-            if force_target_mu is None or force_target_log_sigma is None:
-                predicted_target_mu, predicted_target_log_sigma = self._predict_force_target(prefix_pooled)
-                if force_target_mu is None:
-                    force_target_mu = predicted_target_mu
-                if force_target_log_sigma is None:
-                    force_target_log_sigma = predicted_target_log_sigma
-        else:
-            prefix_pooled = None
+            if force_target_mu is None:
+                force_target_mu = self._current_real_force(observation, jnp.float32)
+            if force_target_log_sigma is None and force_target_mu is not None:
+                force_target_log_sigma = jnp.zeros_like(force_target_mu, dtype=jnp.float32)
+            enable_force_guidance = force_target_mu is not None and force_target_log_sigma is not None
 
         if enable_force_guidance:
             if force_guidance_lambda is None:
@@ -635,7 +643,6 @@ class Pi0(_model.BaseModel):
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
             if enable_force_guidance:
-                assert prefix_pooled is not None
                 assert force_target_mu is not None
                 assert force_target_log_sigma is not None
                 base_v_t = jax.lax.stop_gradient(v_t)
