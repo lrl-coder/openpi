@@ -72,9 +72,7 @@ class Pi0(_model.BaseModel):
         self.pi05 = config.pi05
         self.force_guidance = config.force_guidance
         self.force_dim = config.force_dim
-        self.force_history_global_len = config.force_history_global_len
         self.force_history_local_len = config.force_history_local_len
-        self.force_global_patch_size = config.force_global_patch_size
         self.force_loss_weight = config.force_loss_weight
         self.force_target_loss_weight = config.force_target_loss_weight
         self.force_guidance_lambda_max = config.force_guidance_lambda_max
@@ -120,11 +118,6 @@ class Pi0(_model.BaseModel):
             )
             self.force_predictor_in = nnx.Linear(force_predictor_input_dim, action_expert_config.width, rngs=rngs)
             self.force_predictor_out = nnx.Linear(action_expert_config.width, 2 * config.force_dim, rngs=rngs)
-            force_global_patch_dim = self.force_global_patch_size * config.force_dim
-            self.force_global_patch_proj = nnx.Linear(force_global_patch_dim, paligemma_config.width, rngs=rngs)
-            self.force_global_pos_embedding = nnx.Param(
-                jnp.zeros((self.force_num_global_tokens, paligemma_config.width), dtype=jnp.float32)
-            )
             self.force_local_conv1 = nnx.Conv(
                 config.force_dim, 64, kernel_size=3, padding="CAUSAL", rngs=rngs
             )
@@ -149,10 +142,6 @@ class Pi0(_model.BaseModel):
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
-    @property
-    def force_num_global_tokens(self) -> int:
-        return math.ceil(self.force_history_global_len / self.force_global_patch_size)
-
     def _pool_prefix(self, prefix_out, prefix_mask):
         mask = prefix_mask.astype(prefix_out.dtype)[..., None]
         denom = jnp.maximum(jnp.sum(mask, axis=1), 1.0)
@@ -160,10 +149,7 @@ class Pi0(_model.BaseModel):
 
     def _force_history_or_current(self, obs: _model.Observation, dtype, *, scope: str):
         batch_size = obs.state.shape[0]
-        if scope == "global":
-            target_len = self.force_history_global_len
-            preferred_history = obs.force_history_global
-        elif scope == "local":
+        if scope == "local":
             target_len = self.force_history_local_len
             preferred_history = obs.force_history_local
         else:
@@ -185,21 +171,6 @@ class Pi0(_model.BaseModel):
         elif history_len > target_len:
             force_history = force_history[:, -target_len:, :]
         return force_history
-
-    def _embed_force_global_tokens(self, obs: _model.Observation, dtype):
-        force_history = self._force_history_or_current(obs, dtype, scope="global")
-        pad_len = self.force_num_global_tokens * self.force_global_patch_size - self.force_history_global_len
-        if pad_len > 0:
-            force_history = jnp.pad(force_history, ((0, 0), (pad_len, 0), (0, 0)))
-        patches = einops.rearrange(
-            force_history,
-            "b (n p) f -> b n (p f)",
-            n=self.force_num_global_tokens,
-            p=self.force_global_patch_size,
-        )
-        tokens = self.force_global_patch_proj(patches)
-        pos = self.force_global_pos_embedding.value.astype(tokens.dtype)
-        return tokens + pos[None, :, :]
 
     def _embed_force_local_token(self, obs: _model.Observation, dtype):
         force_history = self._force_history_or_current(obs, dtype, scope="local")
@@ -354,13 +325,6 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
-        if self.force_guidance:
-            force_tokens = self._embed_force_global_tokens(obs, next(iter(obs.images.values())).dtype)
-            tokens.append(force_tokens)
-            input_mask.append(jnp.ones(force_tokens.shape[:2], dtype=jnp.bool_))
-            # Global force history tokens are observed context and can attend bidirectionally with image/language prefix tokens.
-            ar_mask += [False] * force_tokens.shape[1]
-
         # embed images
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)

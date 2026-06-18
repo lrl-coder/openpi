@@ -37,11 +37,11 @@ class Pi0Config(_model.BaseModelConfig):
     # Force-aware pi0 extensions. Disabled by default to keep the released pi0 behavior unchanged.
     force_guidance: bool = False
     force_dim: int = 6
-    # Global force history is a longer contact context for the VLM-level semantic target.
+    # Deprecated compatibility fields. Historical force is no longer fed into the VLM prefix.
     force_history_global_len: int = 64
+    force_global_patch_size: int = 8
     # Local force history is a shorter contact context for immediate action conditioning.
     force_history_local_len: int = 16
-    force_global_patch_size: int = 8
     force_loss_weight: float = 0.0
     force_target_loss_weight: float = 0.0
     force_guidance_lambda_max: float = 0.0
@@ -99,11 +99,7 @@ class Pi0Config(_model.BaseModelConfig):
                     if self.force_guidance
                     else None
                 ),
-                force_history_global=(
-                    jax.ShapeDtypeStruct([batch_size, self.force_history_global_len, self.force_dim], jnp.float32)
-                    if self.force_guidance
-                    else None
-                ),
+                force_history_global=None,
                 force_history_local=(
                     jax.ShapeDtypeStruct([batch_size, self.force_history_local_len, self.force_dim], jnp.float32)
                     if self.force_guidance
