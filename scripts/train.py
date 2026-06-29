@@ -134,6 +134,8 @@ def _log_force_prediction_trace(
     log_sigma = np.asarray(trace["log_sigma"])
     sigma = np.asarray(trace["sigma"])
     var = np.asarray(trace["var"])
+    query_feature = np.asarray(trace["query_feature"])
+    force_feature = np.asarray(trace["force_feature"])
 
     sample_count = min(max_samples, target.shape[0])
     out_dir = checkpoint_dir / "force_prediction_traces"
@@ -146,6 +148,8 @@ def _log_force_prediction_trace(
         log_sigma=log_sigma[:sample_count],
         sigma=sigma[:sample_count],
         var=var[:sample_count],
+        query_feature=query_feature[:sample_count],
+        force_feature=force_feature[:sample_count],
     )
 
     rows = []
@@ -174,13 +178,51 @@ def _log_force_prediction_trace(
         writer.writerow(columns)
         writer.writerows(rows)
 
+    feature_rows = []
+    feature_dim = query_feature.shape[-1]
+    for sample_idx in range(sample_count):
+        for dim_idx in range(feature_dim):
+            feature_rows.append(
+                [
+                    sample_idx,
+                    dim_idx,
+                    float(query_feature[sample_idx, dim_idx]),
+                    float(force_feature[sample_idx, dim_idx]),
+                ]
+            )
+
+    feature_columns = ["sample", "dim", "query_feature", "force_feature"]
+    feature_csv_path = out_dir / f"step_{step:08d}_semantic_features.csv"
+    with open(feature_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(feature_columns)
+        writer.writerows(feature_rows)
+
     table = wandb.Table(
         columns=columns,
         data=rows,
     )
+    feature_table = wandb.Table(
+        columns=feature_columns,
+        data=feature_rows,
+    )
+    query_feature_std = float(np.mean(np.std(query_feature, axis=0)))
+    force_feature_std = float(np.mean(np.std(force_feature, axis=0)))
+    feature_cosine = np.sum(query_feature * force_feature, axis=-1)
     wandb.save(str(out_path), base_path=str(checkpoint_dir))
     wandb.save(str(csv_path), base_path=str(checkpoint_dir))
-    wandb.log({"force_prediction_trace/table": table}, step=step)
+    wandb.save(str(feature_csv_path), base_path=str(checkpoint_dir))
+    wandb.log(
+        {
+            "force_prediction_trace/table": table,
+            "force_semantic_features/table": feature_table,
+            "force_semantic_features/query_batch_std_mean": query_feature_std,
+            "force_semantic_features/force_batch_std_mean": force_feature_std,
+            "force_semantic_features/cosine_mean": float(np.mean(feature_cosine)),
+            "force_semantic_features/cosine_std": float(np.std(feature_cosine)),
+        },
+        step=step,
+    )
 
 
 class CsvMetricLogger:

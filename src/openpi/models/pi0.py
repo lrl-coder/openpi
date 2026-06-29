@@ -492,7 +492,9 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (_, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
         force_mu, force_log_sigma = self._predict_force_from_action_head(
             observation,
             actions,
@@ -500,12 +502,16 @@ class Pi0(_model.BaseModel):
             kv_cache,
         )
         force_log_sigma = jnp.clip(force_log_sigma, -5.0, 3.0)
+        query_feature = self._semantic_force_query_feature(prefix_out)
+        force_feature = self._encode_force_semantic_feature(observation, prefix_out.dtype)
         return {
             "target": observation.force_targets.astype(jnp.float32),
             "mu": force_mu.astype(jnp.float32),
             "log_sigma": force_log_sigma,
             "sigma": jnp.exp(force_log_sigma),
             "var": jnp.exp(2.0 * force_log_sigma),
+            "query_feature": query_feature.astype(jnp.float32),
+            "force_feature": force_feature.astype(jnp.float32),
         }
 
     @at.typecheck
