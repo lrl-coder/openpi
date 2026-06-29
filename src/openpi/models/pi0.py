@@ -184,6 +184,7 @@ class Pi0(_model.BaseModel):
         self.force_global_patch_size = config.force_global_patch_size
         self.force_loss_weight = config.force_loss_weight
         self.force_target_loss_weight = config.force_target_loss_weight
+        self.force_physical_loss_weight = config.force_physical_loss_weight
         self.force_guidance_lambda_max = config.force_guidance_lambda_max
         self.force_guidance_k = config.force_guidance_k
         self.force_guidance_tau0 = config.force_guidance_tau0
@@ -249,6 +250,12 @@ class Pi0(_model.BaseModel):
             self.force_semantic_out = nnx.Linear(
                 config.force_semantic_feature_dim, config.force_semantic_feature_dim, rngs=rngs
             )
+            self.force_physical_summary_out = nnx.Linear(
+                config.force_semantic_feature_dim, 5 * config.force_dim, rngs=rngs
+            )
+            self.force_action_query_proj = nnx.Linear(
+                action_expert_config.width, config.force_semantic_feature_dim, rngs=rngs
+            )
             self.force_local_conv1 = nnx.Conv(
                 config.force_dim, 64, kernel_size=3, padding="CAUSAL", rngs=rngs
             )
@@ -307,11 +314,18 @@ class Pi0(_model.BaseModel):
         query = self.force_semantic_query.value.astype(dtype)
         return jnp.broadcast_to(query[None, :, :], (batch_size, query.shape[0], query.shape[1]))
 
-    def _encode_force_semantic_feature(self, obs: _model.Observation, dtype):
+    def _force_semantic_raw_feature(self, obs: _model.Observation, dtype):
         force_history = self._force_history_or_current(obs, dtype, scope="global")
         hidden = self.force_semantic_tcn(force_history)
         pooled = jnp.mean(hidden, axis=1)
-        feature = self.force_semantic_out(pooled)
+        return self.force_semantic_out(pooled)
+
+    def _encode_force_semantic_feature(self, obs: _model.Observation, dtype):
+        return self._l2_normalize(self._force_semantic_raw_feature(obs, dtype))
+
+    def _action_contact_feature(self, action_features):
+        pooled = jnp.mean(action_features, axis=1)
+        feature = self.force_action_query_proj(pooled)
         return self._l2_normalize(feature)
 
     def _semantic_force_query_feature(self, prefix_out):
@@ -319,12 +333,35 @@ class Pi0(_model.BaseModel):
         query_feature = self.force_semantic_query_proj(query_hidden)
         return self._l2_normalize(query_feature)
 
-    def _semantic_force_alignment_loss(self, obs: _model.Observation, prefix_out):
-        query_feature = self._semantic_force_query_feature(prefix_out)
-        force_feature = self._encode_force_semantic_feature(obs, prefix_out.dtype)
-        cosine = jnp.sum(query_feature * force_feature, axis=-1)
+    def _force_target_summary(self, force_targets):
+        force_targets = force_targets.astype(jnp.float32)
+        mean = jnp.mean(force_targets, axis=1)
+        std = jnp.sqrt(jnp.var(force_targets, axis=1) + 1e-6)
+        max_abs = jnp.max(jnp.abs(force_targets), axis=1)
+        delta = force_targets[:, -1, :] - force_targets[:, 0, :]
+        impulse = jnp.mean(jnp.abs(force_targets), axis=1)
+        return jnp.concatenate([mean, std, max_abs, delta, impulse], axis=-1)
+
+    def _force_physical_anchor_loss(self, obs: _model.Observation, force_raw_feature):
+        if obs.force_targets is None:
+            return None, None
+        target_summary = jax.lax.stop_gradient(self._force_target_summary(obs.force_targets))
+        pred_summary = self.force_physical_summary_out(force_raw_feature).astype(jnp.float32)
+        residual = pred_summary - target_summary
+        loss = jnp.mean(jnp.square(residual), axis=-1)
+        return loss, {
+            "force_physical_summary_mse": jnp.mean(loss),
+            "force_physical_summary_mae": jnp.mean(jnp.abs(residual)),
+            "force_physical_summary_target_std_mean": jnp.mean(jnp.std(target_summary, axis=0)),
+            "force_physical_summary_pred_std_mean": jnp.mean(jnp.std(pred_summary, axis=0)),
+        }
+
+    def _force_distillation_loss(self, action_features, force_feature):
+        query_feature = self._action_contact_feature(action_features)
+        teacher_feature = jax.lax.stop_gradient(force_feature)
+        cosine = jnp.sum(query_feature * teacher_feature, axis=-1)
         loss = 1.0 - cosine
-        return loss, cosine
+        return loss, cosine, query_feature
 
     def _embed_force_local_token(self, obs: _model.Observation, dtype):
         force_history = self._force_history_or_current(obs, dtype, scope="local")
@@ -495,14 +532,16 @@ class Pi0(_model.BaseModel):
         (prefix_out, _), kv_cache = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
-        force_mu, force_log_sigma = self._predict_force_from_action_head(
+        clean_action_features = self._action_features_from_prefix_cache(
             observation,
             actions,
+            jnp.zeros((actions.shape[0],), dtype=actions.dtype),
             prefix_mask,
             kv_cache,
         )
+        force_mu, force_log_sigma = self._decode_force_from_action_features(clean_action_features)
         force_log_sigma = jnp.clip(force_log_sigma, -5.0, 3.0)
-        query_feature = self._semantic_force_query_feature(prefix_out)
+        query_feature = self._action_contact_feature(clean_action_features)
         force_feature = self._encode_force_semantic_feature(observation, prefix_out.dtype)
         return {
             "target": observation.force_targets.astype(jnp.float32),
@@ -659,10 +698,22 @@ class Pi0(_model.BaseModel):
         if not self.force_guidance:
             return loss, info
 
-        if self.force_loss_weight > 0.0 and observation.force_targets is not None:
-            force_mu, force_log_sigma = self._predict_force_from_action_head(
-                observation, actions, prefix_mask, kv_cache
+        clean_action_features = None
+        needs_clean_action_features = (
+            self.force_loss_weight > 0.0 and observation.force_targets is not None
+        ) or self.force_target_loss_weight > 0.0
+        if needs_clean_action_features:
+            clean_action_features = self._action_features_from_prefix_cache(
+                observation,
+                actions,
+                jnp.zeros((actions.shape[0],), dtype=actions.dtype),
+                prefix_mask,
+                kv_cache,
             )
+
+        if self.force_loss_weight > 0.0 and observation.force_targets is not None:
+            assert clean_action_features is not None
+            force_mu, force_log_sigma = self._decode_force_from_action_features(clean_action_features)
             force_loss = self._diag_gaussian_nll(observation.force_targets, force_mu, force_log_sigma)
             loss = loss + self.force_loss_weight * force_loss
             if return_info:
@@ -678,13 +729,42 @@ class Pi0(_model.BaseModel):
                     )
                 )
 
-        if self.force_target_loss_weight > 0.0:
-            semantic_loss, semantic_cosine = self._semantic_force_alignment_loss(observation, prefix_out)
-            loss = loss + self.force_target_loss_weight * semantic_loss[:, None]
+        force_raw_feature = None
+        force_feature = None
+        if (
+            self.force_physical_loss_weight > 0.0 and observation.force_targets is not None
+        ) or self.force_target_loss_weight > 0.0:
+            force_raw_feature = self._force_semantic_raw_feature(observation, prefix_out.dtype)
+            force_feature = self._l2_normalize(force_raw_feature)
+
+        if self.force_physical_loss_weight > 0.0 and observation.force_targets is not None:
+            assert force_raw_feature is not None
+            physical_loss, physical_info = self._force_physical_anchor_loss(observation, force_raw_feature)
+            assert physical_loss is not None
+            loss = loss + self.force_physical_loss_weight * physical_loss[:, None]
             if return_info:
-                info["loss_force_semantic_align"] = jnp.mean(semantic_loss)
-                info["loss_force_semantic_align_weighted"] = self.force_target_loss_weight * jnp.mean(semantic_loss)
-                info["force_semantic_cosine_mean"] = jnp.mean(semantic_cosine)
+                assert physical_info is not None
+                info["loss_force_physical_anchor"] = jnp.mean(physical_loss)
+                info["loss_force_physical_anchor_weighted"] = (
+                    self.force_physical_loss_weight * jnp.mean(physical_loss)
+                )
+                info.update(physical_info)
+
+        if self.force_target_loss_weight > 0.0:
+            assert clean_action_features is not None
+            assert force_feature is not None
+            distill_loss, distill_cosine, _ = self._force_distillation_loss(clean_action_features, force_feature)
+            loss = loss + self.force_target_loss_weight * distill_loss[:, None]
+            if return_info:
+                info["loss_force_distill"] = jnp.mean(distill_loss)
+                info["loss_force_distill_weighted"] = self.force_target_loss_weight * jnp.mean(distill_loss)
+                info["force_distill_cosine_mean"] = jnp.mean(distill_cosine)
+                # Compatibility names for existing monitoring dashboards and CSV readers.
+                info["loss_force_semantic_align"] = jnp.mean(distill_loss)
+                info["loss_force_semantic_align_weighted"] = (
+                    self.force_target_loss_weight * jnp.mean(distill_loss)
+                )
+                info["force_semantic_cosine_mean"] = jnp.mean(distill_cosine)
 
         return loss, info
 
