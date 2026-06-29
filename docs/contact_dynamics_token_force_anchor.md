@@ -20,10 +20,10 @@ loss = 1 - cosine(query_feature, force_feature)
 
 ```text
 force branch must explain physical force statistics first;
-action/query branch only distills this physically grounded representation.
+the prefix semantic query only distills this physically grounded representation.
 ```
 
-也就是说，force branch 不再只是被另一个可漂移的 embedding 拉近，而是必须预测未来 force 的可解释物理 summary。
+也就是说，force branch 不再只是被另一个可漂移的 embedding 拉近，而是必须预测未来 force 的可解释物理 summary。prefix semantic query 仍然作为 alignment student，但它只学习一个被物理目标锚定住的 stop-gradient teacher。
 
 ## 1. Physical anchoring
 
@@ -67,11 +67,10 @@ L_phys = MSE(force_physical_summary_out(force_raw_feature), stopgrad(summary))
 
 ## 2. Asymmetric distillation
 
-原来的 prefix semantic query 不再作为主要 alignment student。新 student 来自 action expert 对 clean action chunk 的 hidden states：
+student 仍然来自原来的 prefix semantic query：
 
 ```text
-clean_action_features = action_expert(observation, ground_truth_actions, timestep=0)
-action_contact_feature = normalize(force_action_query_proj(mean(clean_action_features over horizon)))
+query_feature = normalize(force_semantic_query_proj(prefix_out[:, 0, :]))
 ```
 
 teacher 来自物理锚定后的 force branch：
@@ -83,10 +82,10 @@ force_feature = normalize(force_raw_feature)
 distillation loss：
 
 ```text
-L_distill = 1 - cosine(action_contact_feature, stopgrad(force_feature))
+L_distill = 1 - cosine(query_feature, stopgrad(force_feature))
 ```
 
-关键是 `stopgrad(force_feature)`。这样 action/query branch 学习 force branch 中已经被物理 summary 约束住的接触动力学表示，但不会反向把 force branch 拖向常量方向。
+关键是 `stopgrad(force_feature)`。这样 prefix semantic query 学习 force branch 中已经被物理 summary 约束住的接触动力学表示，但不会反向把 force branch 拖向常量方向。
 
 旧配置字段 `force_target_loss_weight` 现在继续作为 distillation 权重使用，保留 CLI 和旧日志兼容。
 
@@ -131,7 +130,6 @@ src/openpi/models/pi0.py
 _force_semantic_raw_feature
 _force_target_summary
 _force_physical_anchor_loss
-_action_contact_feature
 _force_distillation_loss
 force_prediction_trace
 _compute_loss_and_info
@@ -199,7 +197,7 @@ loss_force_semantic_align
 force_semantic_cosine_mean
 ```
 
-但它们现在表示 action contact feature 到 stop-gradient force feature 的 distillation，而不是原来的 symmetric semantic alignment。
+但它们现在表示 prefix semantic query 到 stop-gradient force feature 的 distillation，而不是原来的 symmetric semantic alignment。
 
 trace 文件里的：
 
@@ -207,7 +205,7 @@ trace 文件里的：
 query_feature
 ```
 
-现在对应 `action_contact_feature`，不再是 prefix semantic query feature。因此新的 `query_batch_std_mean` 更应该理解为 action/contact query 的 batch diversity。
+仍然对应 prefix semantic query feature。因此新的 `query_batch_std_mean` 仍然是 semantic query 的 batch diversity。
 
 ## 判断是否起效
 
@@ -246,7 +244,6 @@ Physics-anchored contact dynamics distillation.
 
 ```text
 Naive cross-modal cosine alignment admits a degenerate constant solution in low-diversity contact-rich data.
-We therefore anchor the force encoder with future force statistics and distill the resulting contact-dynamics representation into the policy's action branch using a stop-gradient teacher.
+We therefore anchor the force encoder with future force statistics and distill the resulting contact-dynamics representation into a prefix semantic query using a stop-gradient teacher.
 This keeps the module lightweight while making the learned representation physically identifiable.
 ```
-

@@ -253,9 +253,6 @@ class Pi0(_model.BaseModel):
             self.force_physical_summary_out = nnx.Linear(
                 config.force_semantic_feature_dim, 5 * config.force_dim, rngs=rngs
             )
-            self.force_action_query_proj = nnx.Linear(
-                action_expert_config.width, config.force_semantic_feature_dim, rngs=rngs
-            )
             self.force_local_conv1 = nnx.Conv(
                 config.force_dim, 64, kernel_size=3, padding="CAUSAL", rngs=rngs
             )
@@ -323,11 +320,6 @@ class Pi0(_model.BaseModel):
     def _encode_force_semantic_feature(self, obs: _model.Observation, dtype):
         return self._l2_normalize(self._force_semantic_raw_feature(obs, dtype))
 
-    def _action_contact_feature(self, action_features):
-        pooled = jnp.mean(action_features, axis=1)
-        feature = self.force_action_query_proj(pooled)
-        return self._l2_normalize(feature)
-
     def _semantic_force_query_feature(self, prefix_out):
         query_hidden = prefix_out[:, 0, :]
         query_feature = self.force_semantic_query_proj(query_hidden)
@@ -356,8 +348,8 @@ class Pi0(_model.BaseModel):
             "force_physical_summary_pred_std_mean": jnp.mean(jnp.std(pred_summary, axis=0)),
         }
 
-    def _force_distillation_loss(self, action_features, force_feature):
-        query_feature = self._action_contact_feature(action_features)
+    def _force_distillation_loss(self, prefix_out, force_feature):
+        query_feature = self._semantic_force_query_feature(prefix_out)
         teacher_feature = jax.lax.stop_gradient(force_feature)
         cosine = jnp.sum(query_feature * teacher_feature, axis=-1)
         loss = 1.0 - cosine
@@ -541,7 +533,7 @@ class Pi0(_model.BaseModel):
         )
         force_mu, force_log_sigma = self._decode_force_from_action_features(clean_action_features)
         force_log_sigma = jnp.clip(force_log_sigma, -5.0, 3.0)
-        query_feature = self._action_contact_feature(clean_action_features)
+        query_feature = self._semantic_force_query_feature(prefix_out)
         force_feature = self._encode_force_semantic_feature(observation, prefix_out.dtype)
         return {
             "target": observation.force_targets.astype(jnp.float32),
@@ -699,9 +691,7 @@ class Pi0(_model.BaseModel):
             return loss, info
 
         clean_action_features = None
-        needs_clean_action_features = (
-            self.force_loss_weight > 0.0 and observation.force_targets is not None
-        ) or self.force_target_loss_weight > 0.0
+        needs_clean_action_features = self.force_loss_weight > 0.0 and observation.force_targets is not None
         if needs_clean_action_features:
             clean_action_features = self._action_features_from_prefix_cache(
                 observation,
@@ -751,9 +741,8 @@ class Pi0(_model.BaseModel):
                 info.update(physical_info)
 
         if self.force_target_loss_weight > 0.0:
-            assert clean_action_features is not None
             assert force_feature is not None
-            distill_loss, distill_cosine, _ = self._force_distillation_loss(clean_action_features, force_feature)
+            distill_loss, distill_cosine, _ = self._force_distillation_loss(prefix_out, force_feature)
             loss = loss + self.force_target_loss_weight * distill_loss[:, None]
             if return_info:
                 info["loss_force_distill"] = jnp.mean(distill_loss)
