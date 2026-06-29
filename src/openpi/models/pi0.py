@@ -19,6 +19,113 @@ logger = logging.getLogger("openpi")
 _LOG_2PI = math.log(2.0 * math.pi)
 
 
+class _ForceSemanticTemporalBlock(nnx.Module):
+    def __init__(
+        self,
+        n_inputs: int,
+        n_outputs: int,
+        *,
+        kernel_size: int,
+        dilation: int,
+        dropout: float,
+        rngs: nnx.Rngs,
+    ):
+        padding = "CAUSAL"
+        kernel_init = nnx.initializers.normal(stddev=0.01)
+        self.conv1 = nnx.Conv(
+            n_inputs,
+            n_outputs,
+            kernel_size=kernel_size,
+            padding=padding,
+            kernel_dilation=dilation,
+            kernel_init=kernel_init,
+            rngs=rngs,
+        )
+        self.dropout1 = nnx.Dropout(dropout, rngs=rngs)
+        self.conv2 = nnx.Conv(
+            n_outputs,
+            n_outputs,
+            kernel_size=kernel_size,
+            padding=padding,
+            kernel_dilation=dilation,
+            kernel_init=kernel_init,
+            rngs=rngs,
+        )
+        self.dropout2 = nnx.Dropout(dropout, rngs=rngs)
+        self.downsample = (
+            nnx.Conv(
+                n_inputs,
+                n_outputs,
+                kernel_size=1,
+                padding="VALID",
+                kernel_init=kernel_init,
+                rngs=rngs,
+            )
+            if (n_inputs != n_outputs)
+            else None
+        )
+
+    def __call__(self, x):
+        hidden = self.conv1(x)
+        hidden = nnx.relu(hidden)
+        hidden = self.dropout1(hidden)
+        hidden = self.conv2(hidden)
+        hidden = nnx.relu(hidden)
+        hidden = self.dropout2(hidden)
+        residual = x if self.downsample is None else self.downsample(x)
+        return nnx.relu(hidden + residual)
+
+
+class _ForceSemanticTCN(nnx.Module):
+    def __init__(
+        self,
+        num_inputs: int,
+        num_channels: tuple[int, int, int, int],
+        *,
+        kernel_size: int = 2,
+        dropout: float = 0.2,
+        rngs: nnx.Rngs,
+    ):
+        self.block1 = _ForceSemanticTemporalBlock(
+            num_inputs,
+            num_channels[0],
+            kernel_size=kernel_size,
+            dilation=1,
+            dropout=dropout,
+            rngs=rngs,
+        )
+        self.block2 = _ForceSemanticTemporalBlock(
+            num_channels[0],
+            num_channels[1],
+            kernel_size=kernel_size,
+            dilation=2,
+            dropout=dropout,
+            rngs=rngs,
+        )
+        self.block3 = _ForceSemanticTemporalBlock(
+            num_channels[1],
+            num_channels[2],
+            kernel_size=kernel_size,
+            dilation=4,
+            dropout=dropout,
+            rngs=rngs,
+        )
+        self.block4 = _ForceSemanticTemporalBlock(
+            num_channels[2],
+            num_channels[3],
+            kernel_size=kernel_size,
+            dilation=8,
+            dropout=dropout,
+            rngs=rngs,
+        )
+
+    def __call__(self, x):
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        return self.block4(x)
+
+
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
 
@@ -127,23 +234,18 @@ class Pi0(_model.BaseModel):
             self.force_semantic_query_proj = nnx.Linear(
                 paligemma_config.width, config.force_semantic_feature_dim, rngs=rngs
             )
-            self.force_semantic_conv1 = nnx.Conv(
-                config.force_dim, 64, kernel_size=5, padding="CAUSAL", rngs=rngs
-            )
-            self.force_semantic_norm1 = nnx.LayerNorm(64, rngs=rngs)
-            self.force_semantic_conv2 = nnx.Conv(
-                64, 128, kernel_size=3, padding="CAUSAL", kernel_dilation=2, rngs=rngs
-            )
-            self.force_semantic_norm2 = nnx.LayerNorm(128, rngs=rngs)
-            self.force_semantic_conv3 = nnx.Conv(
-                128,
-                config.force_semantic_feature_dim,
-                kernel_size=3,
-                padding="CAUSAL",
-                kernel_dilation=4,
+            self.force_semantic_tcn = _ForceSemanticTCN(
+                config.force_dim,
+                (
+                    64,
+                    128,
+                    config.force_semantic_feature_dim,
+                    config.force_semantic_feature_dim,
+                ),
+                kernel_size=2,
+                dropout=0.2,
                 rngs=rngs,
             )
-            self.force_semantic_norm3 = nnx.LayerNorm(config.force_semantic_feature_dim, rngs=rngs)
             self.force_semantic_out = nnx.Linear(
                 config.force_semantic_feature_dim, config.force_semantic_feature_dim, rngs=rngs
             )
@@ -207,15 +309,7 @@ class Pi0(_model.BaseModel):
 
     def _encode_force_semantic_feature(self, obs: _model.Observation, dtype):
         force_history = self._force_history_or_current(obs, dtype, scope="global")
-        hidden = self.force_semantic_conv1(force_history)
-        hidden = self.force_semantic_norm1(hidden)
-        hidden = nnx.swish(hidden)
-        hidden = self.force_semantic_conv2(hidden)
-        hidden = self.force_semantic_norm2(hidden)
-        hidden = nnx.swish(hidden)
-        hidden = self.force_semantic_conv3(hidden)
-        hidden = self.force_semantic_norm3(hidden)
-        hidden = nnx.swish(hidden)
+        hidden = self.force_semantic_tcn(force_history)
         pooled = jnp.mean(hidden, axis=1)
         feature = self.force_semantic_out(pooled)
         return self._l2_normalize(feature)
