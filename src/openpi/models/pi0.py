@@ -478,6 +478,36 @@ class Pi0(_model.BaseModel):
         (_, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
         return self._predict_force_from_action_head(observation, actions, prefix_mask, kv_cache)
 
+    def force_prediction_trace(
+        self,
+        observation: _model.Observation,
+        actions: _model.Actions,
+    ) -> dict[str, at.Float[at.Array, "b ah f"]]:
+        if not self.force_guidance:
+            raise ValueError("force_prediction_trace is only available when force_guidance=True.")
+        if observation.force_targets is None:
+            raise ValueError("force_prediction_trace requires observation.force_targets.")
+
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (_, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        force_mu, force_log_sigma = self._predict_force_from_action_head(
+            observation,
+            actions,
+            prefix_mask,
+            kv_cache,
+        )
+        force_log_sigma = jnp.clip(force_log_sigma, -5.0, 3.0)
+        return {
+            "target": observation.force_targets.astype(jnp.float32),
+            "mu": force_mu.astype(jnp.float32),
+            "log_sigma": force_log_sigma,
+            "sigma": jnp.exp(force_log_sigma),
+            "var": jnp.exp(2.0 * force_log_sigma),
+        }
+
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation

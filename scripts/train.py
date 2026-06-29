@@ -122,6 +122,67 @@ def _prefix_eval_metrics(metrics: dict[str, Any], split: str) -> dict[str, Any]:
     return prefixed
 
 
+def _log_force_prediction_trace(
+    trace: dict[str, Any],
+    *,
+    step: int,
+    checkpoint_dir: epath.Path,
+    max_samples: int = 4,
+) -> None:
+    target = np.asarray(trace["target"])
+    mu = np.asarray(trace["mu"])
+    log_sigma = np.asarray(trace["log_sigma"])
+    sigma = np.asarray(trace["sigma"])
+    var = np.asarray(trace["var"])
+
+    sample_count = min(max_samples, target.shape[0])
+    out_dir = checkpoint_dir / "force_prediction_traces"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"step_{step:08d}.npz"
+    np.savez_compressed(
+        out_path,
+        target=target[:sample_count],
+        mu=mu[:sample_count],
+        log_sigma=log_sigma[:sample_count],
+        sigma=sigma[:sample_count],
+        var=var[:sample_count],
+    )
+
+    rows = []
+    horizon = target.shape[1]
+    force_dim = target.shape[2]
+    for sample_idx in range(sample_count):
+        for time_idx in range(horizon):
+            for axis_idx in range(force_dim):
+                rows.append(
+                    [
+                        sample_idx,
+                        time_idx,
+                        axis_idx,
+                        float(target[sample_idx, time_idx, axis_idx]),
+                        float(mu[sample_idx, time_idx, axis_idx]),
+                        float(log_sigma[sample_idx, time_idx, axis_idx]),
+                        float(sigma[sample_idx, time_idx, axis_idx]),
+                        float(var[sample_idx, time_idx, axis_idx]),
+                    ]
+                )
+
+    columns = ["sample", "time", "axis", "target", "mu", "log_sigma", "sigma", "var"]
+    csv_path = out_dir / f"step_{step:08d}.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        writer.writerows(rows)
+
+    table = wandb.Table(
+        columns=columns,
+        data=rows,
+    )
+    wandb.save(str(out_path), base_path=str(checkpoint_dir))
+    wandb.save(str(csv_path), base_path=str(checkpoint_dir))
+    wandb.log({"force_prediction_trace/table": table}, step=step)
+
+
 class CsvMetricLogger:
     """Writes scalar training metrics to CSV while allowing new columns over time."""
 
@@ -209,12 +270,14 @@ def init_train_state(
         )
 
     train_state_shape = jax.eval_shape(init, init_rng)
-    state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
 
     if resume:
+        state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
         return train_state_shape, state_sharding
 
     partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
+    train_state_shape = jax.eval_shape(init, init_rng, partial_params)
+    state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # Initialize the train state and mix in the partial params.
@@ -311,6 +374,21 @@ def diagnostic_step(
     return info
 
 
+@at.typecheck
+def force_prediction_trace_step(
+    config: _config.TrainConfig,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> dict[str, at.Array]:
+    del config
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+    observation, actions = batch
+    if not hasattr(model, "force_prediction_trace"):
+        return {}
+    return model.force_prediction_trace(observation, actions)
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -382,6 +460,11 @@ def main(config: _config.TrainConfig):
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=replicated_sharding,
     )
+    pforce_prediction_trace_step = jax.jit(
+        functools.partial(force_prediction_trace_step, config),
+        in_shardings=(train_state_sharding, data_sharding),
+        out_shardings=replicated_sharding,
+    )
     log_force_diagnostics = bool(getattr(config.model, "force_guidance", False))
     csv_metric_logger = CsvMetricLogger(config.checkpoint_dir / "metrics.csv", resume=resuming)
     logging.info(f"Writing scalar metrics to: {csv_metric_logger.path}")
@@ -406,6 +489,10 @@ def main(config: _config.TrainConfig):
                 with sharding.set_mesh(mesh):
                     diagnostic_info = pdiagnostic_step(train_rng, train_state, batch)
                 reduced_info.update(jax.device_get(jax.tree.map(jnp.mean, diagnostic_info)))
+                with sharding.set_mesh(mesh):
+                    force_trace = pforce_prediction_trace_step(train_state, batch)
+                force_trace = jax.device_get(force_trace)
+                _log_force_prediction_trace(force_trace, step=step, checkpoint_dir=config.checkpoint_dir)
             if eval_iter is not None:
                 eval_infos = []
                 for _ in range(config.eval_num_batches):
