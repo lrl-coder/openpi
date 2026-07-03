@@ -28,7 +28,9 @@ class Checkpoint:
     config: str
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
-    # If true, compute CST from the previous force prediction and pass it to force-guided pi0 sampling.
+    # Enables CFRG from the previous force prediction residual.
+    force_guidance_from_residual: bool = False
+    # Backward-compatible alias for older launch commands.
     force_guidance_from_cst: bool = False
 
 
@@ -95,7 +97,11 @@ def create_policy(args: Args) -> _policy.Policy:
                 _config.get_config(args.policy.config),
                 args.policy.dir,
                 default_prompt=args.default_prompt,
-                sample_kwargs={"force_guidance_from_cst": True} if args.policy.force_guidance_from_cst else None,
+                sample_kwargs=(
+                    {"force_guidance_from_residual": True}
+                    if args.policy.force_guidance_from_residual or args.policy.force_guidance_from_cst
+                    else None
+                ),
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

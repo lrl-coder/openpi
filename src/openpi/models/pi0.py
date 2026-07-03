@@ -765,10 +765,11 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        force_prediction_error: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
         cst_tau: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
         force_guidance_lambda: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
-        force_target_mu: at.Float[at.Array, "b f"] | None = None,
-        force_target_log_sigma: at.Float[at.Array, "b f"] | None = None,
+        force_target_mu: at.Float[at.Array, "b f"] | at.Float[at.Array, "b ah f"] | None = None,
+        force_target_log_sigma: at.Float[at.Array, "b f"] | at.Float[at.Array, "b ah f"] | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -786,9 +787,8 @@ class Pi0(_model.BaseModel):
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
 
-        enable_force_guidance = self.force_guidance and (
-            cst_tau is not None or force_guidance_lambda is not None
-        )
+        force_error = force_prediction_error if force_prediction_error is not None else cst_tau
+        enable_force_guidance = self.force_guidance and (force_error is not None or force_guidance_lambda is not None)
         if enable_force_guidance:
             if force_target_mu is None:
                 force_target_mu = self._current_real_force(observation, jnp.float32)
@@ -798,16 +798,22 @@ class Pi0(_model.BaseModel):
 
         if enable_force_guidance:
             if force_guidance_lambda is None:
-                cst_tau = jnp.asarray(cst_tau, dtype=jnp.float32)
-                if cst_tau.ndim == 0:
-                    cst_tau = jnp.broadcast_to(cst_tau, (batch_size,))
+                force_error = jnp.asarray(force_error, dtype=jnp.float32)
+                if force_error.ndim == 0:
+                    force_error = jnp.broadcast_to(force_error, (batch_size,))
                 force_guidance_lambda = self.force_guidance_lambda_max * jax.nn.sigmoid(
-                    self.force_guidance_k * (cst_tau - self.force_guidance_tau0)
+                    self.force_guidance_k * (force_error - self.force_guidance_tau0)
                 )
             else:
                 force_guidance_lambda = jnp.asarray(force_guidance_lambda, dtype=jnp.float32)
                 if force_guidance_lambda.ndim == 0:
                     force_guidance_lambda = jnp.broadcast_to(force_guidance_lambda, (batch_size,))
+            force_target_mu = jnp.asarray(force_target_mu, dtype=jnp.float32)
+            force_target_log_sigma = jnp.asarray(force_target_log_sigma, dtype=jnp.float32)
+            if force_target_mu.ndim == 2:
+                force_target_mu = force_target_mu[:, None, :]
+            if force_target_log_sigma.ndim == 2:
+                force_target_log_sigma = force_target_log_sigma[:, None, :]
 
         def step(carry):
             x_t, time = carry
@@ -856,9 +862,9 @@ class Pi0(_model.BaseModel):
                         jnp.zeros((batch_size,), dtype=clean_action_estimate.dtype),
                     )
                     nll = self._diag_gaussian_nll(
-                        force_target_mu[:, None, :],
+                        force_target_mu,
                         force_mu,
-                        force_target_log_sigma[:, None, :],
+                        force_target_log_sigma,
                     )
                     return jnp.sum(nll * force_guidance_lambda[:, None])
 

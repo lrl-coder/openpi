@@ -20,7 +20,7 @@ pi0_flexiv_pump_1bottle_inputForce_with_force_guided
 ```
 
 推荐优先使用 `pi0_flexiv_pump_1bottle_inputForce_lora`。openpi README 中给出的显存参考是：LoRA 微调约需要 22.5GB 以上显存，全量微调约需要 70GB 以上显存。
-如果要训练新增 CST/力预测/语义力目标方案，优先使用 `pi0_flexiv_pump_1bottle_inputForce_lora_force_guided`。
+如果要训练新增 CFRG/力预测/语义力目标方案，优先使用 `pi0_flexiv_pump_1bottle_inputForce_lora_force_guided`。
 
 ## 训练/测试集划分
 
@@ -172,9 +172,9 @@ force_targets      = 下一时刻 force 序列, shape = (50, 6)
 force_task_target  = 当前 action chunk 内 force_targets 的均值, shape = (6,), 仅作为兼容字段
 ```
 
-`*_force_guided` 默认仍只把前 7 维送进 pi0 的常规 `state` token；力通过全局/局部两条路径进入 VLM prefix 和动作头 suffix，并通过 `F_phi`、semantic target head、CST 引导影响训练和推理。`*_with_force_guided` 则同时把完整 13 维送进常规 `state` token，用于做对照实验。
+`*_force_guided` 默认仍只把前 7 维送进 pi0 的常规 `state` token；力通过全局/局部两条路径进入 VLM prefix 和动作头 suffix，并通过 `F_phi`、semantic target head、CFRG 引导影响训练和推理。`*_with_force_guided` 则同时把完整 13 维送进常规 `state` token，用于做对照实验。
 
-注意：所有 `*_force_guided` 配置在训练和推理时都要求输入原始 13 维 `observation/state`，因为当前力 `force = state[7:13]` 会被用于构造 `force_history_global`、`force_history_local`、CST 和 `F_phi`。区别只在于常规 pi0 state token 使用前 7 维还是完整 13 维。
+注意：所有 `*_force_guided` 配置在训练和推理时都要求输入原始 13 维 `observation/state`，因为当前力 `force = state[7:13]` 会被用于构造 `force_history_global`、`force_history_local`、CFRG 和 `F_phi`。区别只在于常规 pi0 state token 使用前 7 维还是完整 13 维。
 
 pi0 需要 32 维 state/action，所以 openpi 会把 7 维或 13 维 state 自动 pad 到 32 维。`action` 原始是 7 维：
 
@@ -389,8 +389,8 @@ Force teacher path: force_history_global -> causal dilated Conv1D -> actual forc
 Action local path: force_history_local -> causal dilated Conv1D -> force condition token -> action suffix
 Action auxiliary force predictor F_phi: action-head hidden features -> (mu_f, log_sigma_f)
 Training loss: L = L_FM + 0.05 * L_F_phi + 0.01 * L_semantic_align
-Policy CST: tau = sum((f_t - mu_{f,t-1})^2 / sigma_{f,t-1}^2)
-Guided sampling: lambda(tau) = 0.2 * sigmoid(1.0 * (tau - 6.0)), target force 默认使用当前真实测量力
+Policy CFRG: r_t = sum((f_t - mu_{f,t-1,0})^2 / sigma_{f,t-1,0}^2)
+Guided sampling: lambda(r_t) = 0.2 * sigmoid(1.0 * (r_t - 6.0)), target force 使用上一轮未来预测轨迹的残差校正版
 ```
 
 训练监督里，`F_phi` 不再是独立拼接 MLP；它挂在原动作头的 action-token hidden features 后面，只做数值解码。标签仍使用 action chunk 中每个示范动作对应的下一帧 force。
@@ -400,7 +400,7 @@ Guided sampling: lambda(tau) = 0.2 * sigmoid(1.0 * (tau - 6.0)), target force �
 L_semantic_align = 1 - cosine(z_query, z_force)
 ```
 
-推理时 semantic-force query 仍保留在 VLM prefix 中，但不需要 `force_history_global` 参与 VLM。CST 引导默认使用当前真实测量力作为 guidance target；`force_target_mu/log_sigma` 仍可通过 `sample_actions` 显式覆盖。
+推理时 semantic-force query 仍保留在 VLM prefix 中，但不需要 `force_history_global` 参与 VLM。CFRG 默认用当前真实力与上一轮一步预测之间的残差来门控引导，并把上一轮未来力预测轨迹向前平移后做残差校正；`force_target_mu/log_sigma` 仍可通过 `sample_actions` 显式覆盖。
 
 ### Force NLL / 方差诊断
 
@@ -589,25 +589,30 @@ uv run scripts/serve_policy.py policy:checkpoint \
   --policy.dir=/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora/flexiv_pump_lora/<step>
 ```
 
-force-guided checkpoint 如果要启用 CST 引导，启动时加 `--policy.force-guidance-from-cst`：
+force-guided checkpoint 如果要启用 CFRG 引导，启动时加 `--policy.force-guidance-from-residual`。旧的 `--policy.force-guidance-from-cst` 仍保留为历史兼容别名：
 
 ```bash
 uv run scripts/serve_policy.py policy:checkpoint \
   --policy.config=pi0_flexiv_pump_1bottle_inputForce_lora_force_guided \
   --policy.dir=/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora_force_guided/flexiv_pump_lora_force_guided/<step> \
-  --policy.force-guidance-from-cst
+  --policy.force-guidance-from-residual
 ```
 
-启用后，policy 会保存上一次 `F_phi` 对下一时刻力的预测。下一次推理收到当前 `force` 后计算：
+启用后，policy 会保存上一次 `F_phi` 对未来 action horizon 的完整力预测。下一次推理收到当前 `force` 后，先用上一轮第 0 步预测计算因果力残差：
 
-```text
-tau = sum((f_t - mu_{f,t-1})^2 / sigma_{f,t-1}^2)
-lambda(tau) = 0.2 * sigmoid(1.0 * (tau - 6.0))
-```
+$$
+r_t = \sum_i \frac{(f_{t,i} - \mu^{t-1}_{0,i})^2}{(\sigma^{t-1}_{0,i})^2}
+$$
+
+$$
+\lambda(r_t) = 0.2 \cdot \operatorname{sigmoid}(1.0 \cdot (r_t - 6.0))
+$$
+
+随后将上一轮未来力预测向前平移，并用该残差进行校正，作为本轮 guided sampling 的未来力目标。
 
 第一次推理没有上一帧力预测，因此不会引导；从第二次推理开始生效。
 
-无论是否启用 CST 引导，force-guided policy 都会维护两个滑动窗口：长度 64 的 `force_history_global` 和长度 16 的 `force_history_local`。第一次推理时用当前力重复填满两个窗口，之后每次推理追加当前力并丢弃最旧力。
+无论是否启用 CFRG 引导，force-guided policy 都会维护两个滑动窗口：长度 64 的 `force_history_global` 和长度 16 的 `force_history_local`。第一次推理时用当前力重复填满两个窗口，之后每次推理追加当前力并丢弃最旧力。
 
 客户端传入 observation 时字段应保持为：
 

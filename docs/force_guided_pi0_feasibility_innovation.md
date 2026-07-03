@@ -13,7 +13,7 @@ pi0 的核心思想是将预训练视觉语言模型的语义理解能力与连�
 ```text
 1. semantic-force query：用真实历史力监督 VLM 侧接触语义表征。
 2. local force conditioning：用短历史力条件化 action expert。
-3. CST real-force guidance：用真实测量力进行推理期采样引导。
+3. Causal Force Residual Guidance：用预测力残差进行推理期采样引导。
 ```
 
 这种设计保持了 pi0 的主干能力，同时将力信号拆分为训练语义监督、动作动态建模和在线闭环反馈三个角色。
@@ -45,7 +45,7 @@ force_guidance_tau0: 6.0
 force_history_global: 64 x 6  # 长历史力，用作训练期 force teacher 输入
 force_history_local: 16 x 6   # 短历史力，用作 action suffix 条件
 force_targets: 50 x 6         # 未来动作 chunk 对应的力监督
-force: 6                      # 当前真实力，用于在线 CST
+force: 6                      # 当前真实力，用于在线力预测残差计算
 ```
 
 总损失为：
@@ -135,23 +135,41 @@ action hidden features -> F_phi -> mu_f, log_sigma_f
 L_F_phi = NLL(force_targets; mu_f, sigma_f)
 ```
 
-`F_phi` 的作用不是生成语义力目标，而是让 action hidden state 显式承载动作-力动态关系，并为在线 CST 提供上一轮动作条件下的力预测分布。
+`F_phi` 的作用不是生成语义力目标，而是让 action hidden state 显式承载动作-力动态关系，并为在线 CFRG 提供上一轮动作条件下的力预测分布。
 
-### 3.6 CST Real-Force Guidance
+### 3.6 Causal Force Residual Guidance
 
-CST 用当前真实测量力和上一轮 `F_phi` 预测分布计算偏差：
+CFRG 用当前真实测量力和上一轮 `F_phi` 的一步预测计算因果力残差：
 
-```text
-tau = sum((f_t - mu_prev)^2 / sigma_prev^2)
-```
+$$
+e_t = f_t - \mu^{t-1}_0
+$$
 
-当偏差较大时，guidance strength 增大：
+再用预测方差归一化，得到引导门控分数：
 
-```text
-lambda(tau) = lambda_max * sigmoid(k * (tau - tau0))
-```
+$$
+r_t = e_t^\top \left(\Sigma^{t-1}_0\right)^{-1} e_t
+$$
 
-当前实现中，guided sampling 的默认目标力为当前真实测量力，而不是 VLM 预测的 semantic force target。也就是说，semantic-force query 负责训练表征，CST 负责真实力闭环反馈，二者不混用。这样做降低了在线引导对 VLM 力预测准确性的依赖，使推理链路更接近机器人闭环控制逻辑。
+当残差较大时，guidance strength 增大：
+
+$$
+\lambda(r_t) = \lambda_{max} \operatorname{sigmoid}(k(r_t - \tau_0))
+$$
+
+当前实现不再把当前真实力直接当作整段未来力目标，而是把上一轮预测的未来力轨迹向前平移，并用当前残差校正：
+
+$$
+\tilde{\mu}^{t}_{0:H-1}
+=
+\operatorname{shift}
+\left(
+\mu^{t-1}_{1:H}
+\right)
++ K \cdot \operatorname{clip}(e_t)
+$$
+
+也就是说，semantic-force query 负责训练表征，`F_phi` 负责动作条件下的未来力预测，CFRG 负责真实力闭环反馈和采样引导，三者不混用。这样做避免了在线引导依赖 VLM 力目标，也避免了“当前力等于未来目标”的过强假设。
 
 ## 4. 可行性分析
 
@@ -201,9 +219,9 @@ image tokens
 language tokens
 ```
 
-历史力不再作为 VLM 输入，因此避免了训练时依赖历史力、推理时历史力不可得或噪声较大的 mismatch。短历史力仍可用于 action suffix 的局部控制条件；当前真实力可用于 CST 引导。这符合机器人在线控制场景：语义理解依赖视觉语言，接触修正依赖真实力反馈。
+历史力不再作为 VLM 输入，因此避免了训练时依赖历史力、推理时历史力不可得或噪声较大的 mismatch。短历史力仍可用于 action suffix 的局部控制条件；当前真实力可用于 CFRG 的一步预测残差计算。这符合机器人在线控制场景：语义理解依赖视觉语言，接触修正依赖真实力反馈。
 
-Diffusion Policy 和 Flow Matching 都说明，迭代式动作生成过程可以容纳条件引导或梯度修正 [[4]](https://roboticsconference.org/2023/program/papers/026/) [[5]](https://openreview.net/forum?id=PqvMRDCJT9t)。当前 CST guidance 正是利用这一点，在采样过程中基于真实力偏差修正动作速度场。
+Diffusion Policy 和 Flow Matching 都说明，迭代式动作生成过程可以容纳条件引导或梯度修正 [[4]](https://roboticsconference.org/2023/program/papers/026/) [[5]](https://openreview.net/forum?id=PqvMRDCJT9t)。当前 CFRG 正是利用这一点，在采样过程中基于真实力预测残差修正动作速度场。
 
 结论：推理链路明确，且与生成式动作策略的采样机制兼容。
 
@@ -253,26 +271,34 @@ Flamingo: Perceiver Resampler 压缩视觉特征接入语言模型 [[9]](https:/
 ```text
 semantic-force query: 学习图像语言中的接触语义
 F_phi: 学习动作 hidden state 到未来力分布的映射
-CST guidance: 使用真实力反馈引导采样
+CFRG: 使用因果力预测残差引导采样
 ```
 
-这种解耦使每条路径的监督和功能更清晰。semantic-force query 不需要直接预测未来力数值；`F_phi` 不需要承担 VLM 语义解释；CST 不依赖 VLM 生成的力目标，而直接使用真实力反馈。
+这种解耦使每条路径的监督和功能更清晰。semantic-force query 不需要直接预测未来力数值；`F_phi` 不需要承担 VLM 语义解释；CFRG 不依赖 VLM 生成的力目标，而使用真实力反馈对上一轮未来力预测进行残差校正。
 
 创新点：把“力语义学习”“动作-力动力学建模”“真实力闭环修正”分离，避免常见多模态融合中所有信息混在一个条件向量里的问题。
 
-### 5.4 真实力 CST 引导
+### 5.4 因果力残差引导
 
 旧思路中，VLM semantic target head 预测 `mu*, sigma*`，再将其用于引导动作采样。但图像语言无法唯一确定真实接触力，尤其在接触刚度、摩擦、物体状态和传感器偏置变化时，VLM 预测目标可能不稳定。
 
-当前方案改为：CST guidance 默认使用当前真实测量力作为目标。这样推理闭环更短，物理依据更强：
+当前方案改为：CFRG 使用上一轮一步力预测和当前真实测量力之间的残差作为闭环反馈，并用该残差校正上一轮未来力预测轨迹。这样推理闭环更短，物理依据更强：
 
-```text
-真实力偏离上一轮动作预测分布 -> CST 增大 -> guided sampling 向真实力一致方向修正
-```
+$$
+f_t - \mu^{t-1}_0
+\rightarrow
+r_t
+\rightarrow
+\lambda_t
+\rightarrow
+\tilde{\mu}^{t}_{0:H-1}
+\rightarrow
+\text{guided sampling}
+$$
 
 这与机器人控制中依赖真实传感反馈进行闭环修正的原则一致，也保留了 pi0 / flow matching 动作生成的连续优化特性。
 
-创新点：将真实力反馈作为生成式动作采样的在线引导信号，而不是依赖 VLM 预测的虚拟力目标。
+创新点：将真实力反馈转化为因果力预测残差，并用该残差门控和校正 diffusion 采样中的未来力目标，而不是依赖 VLM 预测的虚拟力目标。
 
 ### 5.5 低侵入式 pi0 增强
 
@@ -343,14 +369,16 @@ success rate
 
 如果 semantic alignment 提升但 action loss 或成功率恶化，说明辅助目标过强。
 
-### 7.4 CST 稳定性风险
+### 7.4 CFRG 稳定性风险
 
-CST guidance 强度过大可能扰动原始 action distribution。需要对以下参数做消融：
+CFRG guidance 强度过大可能扰动原始 action distribution。需要对以下参数做消融：
 
 ```text
 force_guidance_lambda_max
 force_guidance_k
 force_guidance_tau0
+force_residual_gain
+force_residual_clip
 ```
 
 同时应监控动作平滑性、峰值力和力波动，避免引导项造成控制震荡。
@@ -366,7 +394,7 @@ force_guidance_tau0
 2. direct force-in-state baseline
 3. force-guided without semantic-force alignment
 4. force-guided with semantic-force query
-5. force-guided with real-force CST guidance
+5. force-guided with CFRG
 ```
 
 ### 8.2 模块消融
@@ -379,8 +407,8 @@ force_guidance_tau0
 3. remove force teacher encoder
 4. remove local force token
 5. remove F_phi
-6. disable CST guidance
-7. CST real-force target vs predicted force target
+6. disable CFRG
+7. current-force target vs residual-corrected future-force target
 ```
 
 ### 8.3 指标
@@ -409,20 +437,20 @@ inference latency
 
 2. We introduce a learnable semantic-force query that interacts with visual-language tokens and is aligned with force-history representations during training, enabling force-aware semantic grounding without feeding force histories into the VLM prefix.
 
-3. We design a real-force CST guidance mechanism that uses measured contact force to guide flow-matching action sampling, decoupling online force correction from uncertain VLM force-target prediction.
+3. We design Causal Force Residual Guidance (CFRG), which converts the one-step force prediction residual into an adaptive energy guidance term for flow-matching action sampling.
 ```
 
 中文表述可写为：
 
 ```text
-本文提出一种基于 pi0 的力觉增强 VLA 框架。该框架不简单拼接力输入，而是将历史力作为训练期语义监督，将短历史力作为局部动作条件，并在推理阶段使用真实测量力进行 CST 引导。通过 semantic-force query、动作级力预测 F_phi 和真实力闭环采样三者解耦，模型能够在保持 pi0 视觉语言动作生成能力的同时，提高接触操作中的物理感知和动作稳定性。
+本文提出一种基于 pi0 的力觉增强 VLA 框架。该框架不简单拼接力输入，而是将历史力作为训练期语义监督，将短历史力作为局部动作条件，并在推理阶段使用因果力预测残差进行 CFRG 引导。通过 semantic-force query、动作级力预测 F_phi 和真实力闭环采样三者解耦，模型能够在保持 pi0 视觉语言动作生成能力的同时，提高接触操作中的物理感知和动作稳定性。
 ```
 
 ## 10. 总结
 
 本方案具备明确可行性：pi0 的 prefix/suffix 分层结构为力觉模块提供了低侵入式接入点；LoRA 降低了微调成本；力信号可从机器人轨迹中自动获得；Flow Matching 的采样过程允许加入可微引导；触觉/力觉多模态研究也支持力信号对接触操作的重要性。
 
-本方案的创新性在于：不把力信号仅作为状态拼接，而是将其拆分为语义监督、动作力预测和真实力闭环引导；不让历史力直接进入 VLM prefix，而是通过 learnable semantic-force query 学习接触语义；不依赖 VLM 预测在线力目标，而使用真实测量力进行 CST guidance。这使得方法既继承 pi0 的 VLA 泛化能力，又补足接触任务中视觉不可观测的物理反馈。
+本方案的创新性在于：不把力信号仅作为状态拼接，而是将其拆分为语义监督、动作力预测和真实力闭环引导；不让历史力直接进入 VLM prefix，而是通过 learnable semantic-force query 学习接触语义；不依赖 VLM 预测在线力目标，而使用一步力预测残差进行 CFRG guidance。这使得方法既继承 pi0 的 VLA 泛化能力，又补足接触任务中视觉不可观测的物理反馈。
 
 ## 参考文献
 
