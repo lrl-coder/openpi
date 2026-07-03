@@ -76,8 +76,6 @@ model.force_guidance             = True
 model.force_loss_weight          = 0.05
 model.force_target_loss_weight   = 0.01  # 当前作为 semantic-force query 对齐 loss 权重
 model.force_guidance_lambda_max  = 0.2
-model.force_guidance_k           = 1.0
-model.force_guidance_tau0        = 6.0
 ```
 
 LoRA 配置额外设置：
@@ -390,7 +388,7 @@ Action local path: force_history_local -> causal dilated Conv1D -> force conditi
 Action auxiliary force predictor F_phi: action-head hidden features -> (mu_f, log_sigma_f)
 Training loss: L = L_FM + 0.05 * L_F_phi + 0.01 * L_semantic_align
 Policy CFRG: r_t = sum((f_t - mu_{f,t-1,0})^2 / sigma_{f,t-1,0}^2)
-Guided sampling: lambda(r_t) = 0.2 * sigmoid(1.0 * (r_t - 6.0)), target force 使用上一轮未来预测轨迹的残差校正版
+Guided sampling: lambda(r_t) = 0.2 * r_t / (r_t + 6), force reference 只约束 F_phi 的第一个未来力 step
 ```
 
 训练监督里，`F_phi` 不再是独立拼接 MLP；它挂在原动作头的 action-token hidden features 后面，只做数值解码。标签仍使用 action chunk 中每个示范动作对应的下一帧 force。
@@ -400,7 +398,7 @@ Guided sampling: lambda(r_t) = 0.2 * sigmoid(1.0 * (r_t - 6.0)), target force �
 L_semantic_align = 1 - cosine(z_query, z_force)
 ```
 
-推理时 semantic-force query 仍保留在 VLM prefix 中，但不需要 `force_history_global` 参与 VLM。CFRG 默认用当前真实力与上一轮一步预测之间的残差来门控引导，并把上一轮未来力预测轨迹向前平移后做残差校正；`force_target_mu/log_sigma` 仍可通过 `sample_actions` 显式覆盖。
+推理时 semantic-force query 仍保留在 VLM prefix 中，但不需要 `force_history_global` 参与 VLM。CFRG 默认用当前真实力与上一轮一步预测之间的同时间步残差来门控引导，并将当前传感器力作为 observed force anchor 传入 `force_target_mu/log_sigma`；不再平移上一轮未来力预测轨迹，也不再做一阶力外推。`force_target_mu/log_sigma` 仍可通过 `sample_actions` 显式覆盖。
 
 ### Force NLL / 方差诊断
 
@@ -605,10 +603,10 @@ r_t = \sum_i \frac{(f_{t,i} - \mu^{t-1}_{0,i})^2}{(\sigma^{t-1}_{0,i})^2}
 $$
 
 $$
-\lambda(r_t) = 0.2 \cdot \operatorname{sigmoid}(1.0 \cdot (r_t - 6.0))
+\lambda(r_t) = 0.2 \cdot \frac{r_t}{r_t + 6}
 $$
 
-随后将上一轮未来力预测向前平移，并用该残差进行校正，作为本轮 guided sampling 的未来力目标。
+随后用短历史力构造近端一步参考 `f_ref = f_t + (f_t - f_{t-1})`，并只约束本轮候选动作的第一个未来力预测。远期动作仍由原始 diffusion policy 决定。
 
 第一次推理没有上一帧力预测，因此不会引导；从第二次推理开始生效。
 

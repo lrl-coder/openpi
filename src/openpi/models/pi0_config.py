@@ -49,6 +49,7 @@ class Pi0Config(_model.BaseModelConfig):
     # Weight for the force encoder's physical summary prediction anchor.
     force_physical_loss_weight: float = 0.0
     force_guidance_lambda_max: float = 0.0
+    # Legacy fields kept for checkpoint/config compatibility. Proximal CFRG uses the normalized residual score directly.
     force_guidance_k: float = 1.0
     force_guidance_tau0: float = 6.0
 

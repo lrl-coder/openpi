@@ -186,8 +186,6 @@ class Pi0(_model.BaseModel):
         self.force_target_loss_weight = config.force_target_loss_weight
         self.force_physical_loss_weight = config.force_physical_loss_weight
         self.force_guidance_lambda_max = config.force_guidance_lambda_max
-        self.force_guidance_k = config.force_guidance_k
-        self.force_guidance_tau0 = config.force_guidance_tau0
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -801,8 +799,8 @@ class Pi0(_model.BaseModel):
                 force_error = jnp.asarray(force_error, dtype=jnp.float32)
                 if force_error.ndim == 0:
                     force_error = jnp.broadcast_to(force_error, (batch_size,))
-                force_guidance_lambda = self.force_guidance_lambda_max * jax.nn.sigmoid(
-                    self.force_guidance_k * (force_error - self.force_guidance_tau0)
+                force_guidance_lambda = self.force_guidance_lambda_max * (
+                    force_error / (force_error + float(self.force_dim))
                 )
             else:
                 force_guidance_lambda = jnp.asarray(force_guidance_lambda, dtype=jnp.float32)
@@ -861,9 +859,10 @@ class Pi0(_model.BaseModel):
                         kv_cache,
                         jnp.zeros((batch_size,), dtype=clean_action_estimate.dtype),
                     )
+                    target_horizon = force_target_mu.shape[1]
                     nll = self._diag_gaussian_nll(
                         force_target_mu,
-                        force_mu,
+                        force_mu[:, :target_horizon, :],
                         force_target_log_sigma,
                     )
                     return jnp.sum(nll * force_guidance_lambda[:, None])

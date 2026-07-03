@@ -59,10 +59,6 @@ class Policy(BasePolicy):
         self._force_guidance_enabled = bool(
             force_guidance_from_cst if force_guidance_from_residual is None else force_guidance_from_residual
         )
-        force_residual_gain = self._sample_kwargs.pop("force_residual_gain", 0.5)
-        force_residual_clip = self._sample_kwargs.pop("force_residual_clip", 3.0)
-        self._force_residual_gain = float(force_residual_gain)
-        self._force_residual_clip = float(force_residual_clip)
         self._force_model_enabled = bool(getattr(model, "force_guidance", False))
         self._prev_force_mu = None
         self._prev_force_log_sigma = None
@@ -144,30 +140,10 @@ class Policy(BasePolicy):
                 inv_var = jnp.exp(-2.0 * one_step_log_sigma)
                 sample_kwargs["force_prediction_error"] = jnp.sum(jnp.square(residual) * inv_var, axis=-1)
 
-                std = jnp.exp(one_step_log_sigma)
-                clipped_residual = (
-                    jnp.clip(
-                        residual / jnp.maximum(std, 1e-6),
-                        -self._force_residual_clip,
-                        self._force_residual_clip,
-                    )
-                    * std
-                )
-                if prev_mu.ndim == 3:
-                    if prev_mu.shape[1] > 1:
-                        target_mu = jnp.concatenate([prev_mu[:, 1:, :], prev_mu[:, -1:, :]], axis=1)
-                        target_log_sigma = jnp.concatenate(
-                            [prev_log_sigma[:, 1:, :], prev_log_sigma[:, -1:, :]], axis=1
-                        )
-                    else:
-                        target_mu = prev_mu
-                        target_log_sigma = prev_log_sigma
-                    target_mu = target_mu + self._force_residual_gain * clipped_residual[:, None, :]
-                else:
-                    target_mu = force + self._force_residual_gain * clipped_residual
-                    target_log_sigma = one_step_log_sigma
-                sample_kwargs["force_target_mu"] = target_mu
-                sample_kwargs["force_target_log_sigma"] = target_log_sigma
+                # The previous one-step prediction and the current sensor reading refer to the same physical time.
+                # Use the observed force as the proximal sensor anchor; do not extrapolate force dynamics.
+                sample_kwargs["force_target_mu"] = force[:, None, :]
+                sample_kwargs["force_target_log_sigma"] = one_step_log_sigma[:, None, :]
 
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)

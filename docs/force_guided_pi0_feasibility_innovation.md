@@ -35,8 +35,6 @@ force_guidance: True
 force_loss_weight: 0.05
 force_target_loss_weight: 0.01  # 当前作为 semantic-force alignment 权重
 force_guidance_lambda_max: 0.2
-force_guidance_k: 1.0
-force_guidance_tau0: 6.0
 ```
 
 模型输入中，常规 pi0 state token 仍只使用低维机器人状态；历史力不进入 VLM prefix。力相关字段被拆成：
@@ -154,19 +152,23 @@ $$
 当残差较大时，guidance strength 增大：
 
 $$
-\lambda(r_t) = \lambda_{max} \operatorname{sigmoid}(k(r_t - \tau_0))
+\lambda(r_t) = \lambda_{max} \frac{r_t}{r_t + d_f}
 $$
 
-当前实现不再把当前真实力直接当作整段未来力目标，而是把上一轮预测的未来力轨迹向前平移，并用当前残差校正：
+当前实现不再把当前真实力直接当作整段未来力目标，也不构造完整未来力轨迹。CFRG 只使用短历史力构造近端一步参考：
 
 $$
-\tilde{\mu}^{t}_{0:H-1}
+F^{ref}_{t+1}
 =
-\operatorname{shift}
-\left(
-\mu^{t-1}_{1:H}
-\right)
-+ K \cdot \operatorname{clip}(e_t)
+F_t + (F_t - F_{t-1})
+$$
+
+并只约束候选动作的第一个未来力预测：
+
+$$
+F_\phi(o_t,a)_0
+\approx
+F^{ref}_{t+1}
 $$
 
 也就是说，semantic-force query 负责训练表征，`F_phi` 负责动作条件下的未来力预测，CFRG 负责真实力闭环反馈和采样引导，三者不混用。这样做避免了在线引导依赖 VLM 力目标，也避免了“当前力等于未来目标”的过强假设。
@@ -274,7 +276,7 @@ F_phi: 学习动作 hidden state 到未来力分布的映射
 CFRG: 使用因果力预测残差引导采样
 ```
 
-这种解耦使每条路径的监督和功能更清晰。semantic-force query 不需要直接预测未来力数值；`F_phi` 不需要承担 VLM 语义解释；CFRG 不依赖 VLM 生成的力目标，而使用真实力反馈对上一轮未来力预测进行残差校正。
+这种解耦使每条路径的监督和功能更清晰。semantic-force query 不需要直接预测未来力数值；`F_phi` 不需要承担 VLM 语义解释；CFRG 不依赖 VLM 生成的力目标，而使用真实力反馈与上一轮同时间步预测之间的残差来门控采样时的力一致性能量。
 
 创新点：把“力语义学习”“动作-力动力学建模”“真实力闭环修正”分离，避免常见多模态融合中所有信息混在一个条件向量里的问题。
 
@@ -282,7 +284,7 @@ CFRG: 使用因果力预测残差引导采样
 
 旧思路中，VLM semantic target head 预测 `mu*, sigma*`，再将其用于引导动作采样。但图像语言无法唯一确定真实接触力，尤其在接触刚度、摩擦、物体状态和传感器偏置变化时，VLM 预测目标可能不稳定。
 
-当前方案改为：CFRG 使用上一轮一步力预测和当前真实测量力之间的残差作为闭环反馈，并用该残差校正上一轮未来力预测轨迹。这样推理闭环更短，物理依据更强：
+当前方案改为：CFRG 使用上一轮一步力预测和当前真实测量力之间的残差作为闭环反馈，并用该残差门控下一轮采样中的 observed-force anchor。这样推理闭环更短，物理依据更强：
 
 $$
 f_t - \mu^{t-1}_0
@@ -291,14 +293,14 @@ r_t
 \rightarrow
 \lambda_t
 \rightarrow
-\tilde{\mu}^{t}_{0:H-1}
+\text{sensor-anchored force consistency}
 \rightarrow
 \text{guided sampling}
 $$
 
 这与机器人控制中依赖真实传感反馈进行闭环修正的原则一致，也保留了 pi0 / flow matching 动作生成的连续优化特性。
 
-创新点：将真实力反馈转化为因果力预测残差，并用该残差门控和校正 diffusion 采样中的未来力目标，而不是依赖 VLM 预测的虚拟力目标。
+创新点：将真实力反馈转化为因果力预测残差，并用该残差门控 diffusion 采样中的观测力一致性项，而不是依赖 VLM 预测的虚拟力目标或手工构造的未来力轨迹。
 
 ### 5.5 低侵入式 pi0 增强
 
@@ -375,10 +377,6 @@ CFRG guidance 强度过大可能扰动原始 action distribution。需要对以�
 
 ```text
 force_guidance_lambda_max
-force_guidance_k
-force_guidance_tau0
-force_residual_gain
-force_residual_clip
 ```
 
 同时应监控动作平滑性、峰值力和力波动，避免引导项造成控制震荡。
@@ -408,7 +406,7 @@ force_residual_clip
 4. remove local force token
 5. remove F_phi
 6. disable CFRG
-7. current-force target vs residual-corrected future-force target
+7. current-force target vs one-step force-trend reference
 ```
 
 ### 8.3 指标

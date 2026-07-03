@@ -305,19 +305,15 @@ e_t^\top
 e_t
 $$
 
-这个 $r_t$ 用于控制引导强度；而上一轮未来力预测轨迹经过残差校正，形成本轮的因果未来力目标：
+这个 $r_t$ 用于控制引导强度；CFRG 不再构造整段未来力参考，而是用短历史力得到近端一步参考：
 
 $$
-\tilde{\mu}^{t}_{0:H-1}
+F^{ref}_{t+1}
 =
-\operatorname{shift}
-\left(
-\mu^{t-1}_{1:H}
-\right)
-+ K \cdot \operatorname{clip}(e_t)
+F_t + (F_t - F_{t-1})
 $$
 
-然后采样阶段用当前候选动作的 $F_\phi$ 预测结果与 $\tilde{\mu}^{t}$ 构造 energy。这里的关键是：$F_\phi$ 不仅在训练中提供辅助监督，也在推理中提供可微的 action-to-force critic。
+然后采样阶段只用当前候选动作的 $F_\phi$ 第一个未来力预测与 $F^{ref}_{t+1}$ 构造 energy。这里的关键是：$F_\phi$ 不仅在训练中提供辅助监督，也在推理中提供可微的 action-to-force critic。
 
 ## 8. 审稿人可能质疑与回应
 

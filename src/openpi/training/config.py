@@ -926,8 +926,6 @@ _CONFIGS = [
             force_target_loss_weight=0.01,
             force_physical_loss_weight=0.05,
             force_guidance_lambda_max=0.2,
-            force_guidance_k=1.0,
-            force_guidance_tau0=6.0,
         ),
         data=_flexiv_pump_data_config(
             force_guided=True,
@@ -956,8 +954,6 @@ _CONFIGS = [
             force_target_loss_weight=0.01,
             force_physical_loss_weight=0.05,
             force_guidance_lambda_max=0.2,
-            force_guidance_k=1.0,
-            force_guidance_tau0=6.0,
         ),
         data=_flexiv_pump_data_config(
             include_force=True,
@@ -1007,8 +1003,6 @@ _CONFIGS = [
             force_target_loss_weight=0.01,
             force_physical_loss_weight=0.05,
             force_guidance_lambda_max=0.2,
-            force_guidance_k=1.0,
-            force_guidance_tau0=6.0,
         ),
         data=_flexiv_pump_data_config(
             force_guided=True,
@@ -1029,8 +1023,6 @@ _CONFIGS = [
             force_target_loss_weight=0.01,
             force_physical_loss_weight=0.05,
             force_guidance_lambda_max=0.2,
-            force_guidance_k=1.0,
-            force_guidance_tau0=6.0,
         ),
         data=_flexiv_pump_data_config(
             include_force=True,

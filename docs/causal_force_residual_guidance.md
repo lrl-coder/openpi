@@ -1,4 +1,4 @@
-﻿# Causal Force Residual Guidance: 用预测力残差驱动的因果力引导
+﻿# Causal Force Residual Guidance: 用预测力残差驱动的因果力引导  **archived，不要看，已弃用**
 
 ## 1. 背景问题
 
@@ -102,9 +102,9 @@ $$
 \right)
 $$
 
-其中 $\mu^{t-1}_{0}$ 预测的是下一控制周期的力，也就是当前时刻 $t$ 的力。
+其中 $\mu^{t-1}_{0}$ 是上一控制周期对当前时刻 $t$ 的一步力预测。
 
-到了时刻 $t$，机器人真实观测到 $F_t$。于是可以计算标准化预测误差：
+到了时刻 $t$，机器人传感器真实观测到同一物理时间步的力 $F_t$。于是可以计算标准化预测-实测残差：
 
 $$
 r_t
@@ -114,96 +114,67 @@ r_t
 (F_t - \mu^{t-1}_{0})
 $$
 
-$r_t$ 是一个 Mahalanobis residual score。它表示当前真实接触状态相对于上一轮模型预测有多“意外”。
+$r_t$ 是一个 Mahalanobis residual score。它比较的是上一周期预测的当前力和当前周期传感器读到的真实力，因此是因果闭环反馈，而不是未来信息泄漏。
 
 ## 6. 用 Residual 调节引导强度
 
-CFRG 不应该在任何时候都强力引导。若模型预测和真实力一致，则主策略已经工作良好；若预测误差变大，才需要增强力引导。因此引导强度定义为：
+CFRG 不应该在任何时候都强力引导。若同时间步预测力和真实力一致，则主策略和力后果模型仍然解释当前接触状态；若预测-实测残差变大，才需要增强力引导。为了避免额外阈值超参数，我们把标准化残差 $r_t$ 转成一个无参的饱和置信门控：
 
 $$
 \lambda_t
 =
 \lambda_{max}
 \cdot
-\operatorname{sigmoid}
-\left(
-k (r_t - \tau_0)
-\right)
+\frac{r_t}{r_t + d_f}
 $$
 
 其中：
 
 - $\lambda_{max}$ 控制最大引导强度。
-- $k$ 控制门控曲线斜率。
-- $\tau_0$ 是触发引导的误差阈值。
+- $d_f$ 是力/力矩维度，当前为 $6$。
 
 这个设计的含义是：
 
-- $r_t \ll \tau_0$：预测可信，引导弱。
-- $r_t \approx \tau_0$：接触状态开始偏离，引导逐渐增强。
-- $r_t \gg \tau_0$：接触动力学明显失配，引导强。
+- $r_t \approx 0$：上一轮预测与当前真实力一致，引导几乎关闭。
+- $r_t \approx d_f$：残差达到预测分布下的典型量级，引导约为 $\lambda_{max}/2$。
+- $r_t \gg d_f$：接触动力学明显失配，引导接近 $\lambda_{max}$。
 
-## 7. 为什么需要因果未来力参考
+## 7. 近端力一致性，而不是未来力目标
 
 需要先区分两个概念：
 
 - $F_\phi$ 是 **动作到力后果模型**。给定观测和候选动作，它预测“如果执行这个动作，未来力可能是什么”。
-- 力引导还需要一个 **参考力轨迹**。只有存在参考，才能定义候选动作的力后果是否偏离期望。
+- 推理期力引导不需要构造整段未来力目标。对 receding-horizon 控制来说，更自然的是约束动作 chunk 的前端力后果与当前真实接触反馈保持一致。
 
-因此，$F_\phi$ 本身不能直接给出 guidance 目标。如果把同一个候选动作的 $F_\phi$ 输出当作自己的目标，损失会变成自洽项，无法告诉采样器应该往哪个方向修正动作。
-
-推理时又不能访问真实未来力 $F_{t+1:t+H}$。CFRG 采用一个因果、闭环的参考构造：把上一轮预测轨迹向前平移，得到当前时刻可用的未来力先验：
+因此，新的 CFRG 不再把上一轮预测轨迹平移成未来参考。它只构造一个 **近端一步力参考**：
 
 $$
-\bar{\mu}^{t}_{0:H-1}
+F^{ref}_{t+1}
 =
-\operatorname{shift}
+F_t
++
 \left(
-\mu^{t-1}_{1:H-1}
+F_t - F_{t-1}
 \right)
 $$
 
-实际实现中，最后一个 step 可以复制上一轮最后一个预测：
+如果没有上一帧力，则退化为零阶保持：
 
 $$
-\bar{\mu}^{t}_{h}
+F^{ref}_{t+1}
 =
-\begin{cases}
-\mu^{t-1}_{h+1}, & h < H - 1 \\
-\mu^{t-1}_{H-1}, & h = H - 1
-\end{cases}
+F_t
 $$
 
-然后用当前 residual 对整段未来力参考做闭环校正：
+这个参考不是任务目标，也不是未来真实力，而是由当前短历史力得到的 causal contact-continuity prior。它只作用于 $F_\phi$ 预测的第一个未来 force step：
 
 $$
-\tilde{\mu}^{t}_{h}
-=
-\bar{\mu}^{t}_{h}
-+ K \cdot \operatorname{clip}
-\left(
-F_t - \mu^{t-1}_{0}
-\right)
+F_\phi(o_t, a)_0
+\approx
+F^{ref}_{t+1}
 $$
 
-其中 $K$ 是 residual gain。为了避免力传感器尖峰或模型方差过小导致过强修正，clip 在标准差单位下执行：
-
-$$
-\operatorname{clip}(\epsilon_t)
-=
-\sigma^{t-1}_{0}
-\cdot
-\operatorname{clip}
-\left(
-\frac{\epsilon_t}{\sigma^{t-1}_{0}},
--c,
-c
-\right)
-$$
-
-最终得到的 $\tilde{\mu}^{t}_{0:H-1}$ 是一个因果未来力参考。它不是未来真实力，也不是 $F_\phi$ 重新预测出的标签，而是“上一轮预测 + 当前真实反馈”的闭环参考轨迹。它的作用是在采样时提供一个可比较的 reference，使当前候选动作的 $F_\phi$ 预测结果可以被拉向更符合当前真实接触反馈的区域。
-
-如果任务本身能提供外部期望力，例如恒力控制目标、显式阻抗控制器目标，或单独训练的 desired-force head，则可以直接把该外部目标作为 `force_target_mu/log_sigma`，不需要使用上述 residual-corrected reference。CFRG 的构造主要用于没有显式未来力目标、但有在线真实力反馈的场景。
+这样 CFRG 的作用变得非常清楚：当上一轮一步力预测和当前真实力不一致时，用 diffusion guidance 修正下一次采样动作的近端力后果；远期动作仍由原始 action diffusion policy 决定，并在下一控制周期重新观测后再次闭环修正。
 
 ## 8. Diffusion 采样中的力引导 Energy
 
@@ -272,31 +243,27 @@ CFRG 只使用：
 - 当前观测 $o_t$
 - 当前真实力 $F_t$
 - 历史力 $F_{\le t}$
-- 上一轮模型预测的未来力分布
+- 上一轮模型对当前时刻的力预测分布
 
 它不使用未来真实力 $F_{t+1:t+H}$，因此不存在信息泄漏。
 
-### 9.2 解决当前力等于未来目标的问题
+### 9.2 避免构造整段未来力目标
 
-旧设计若默认使用 $F_t$ 作为未来目标，相当于假设：
+旧设计若默认使用 $F_t$ 作为整段未来目标，相当于假设：
 
 $$
 F_{t+1:t+H} = F_t
 $$
 
-CFRG 则使用上一轮预测轨迹构造未来力参考，并由当前真实反馈修正：
+CFRG 只在近端一步使用短历史力外推参考：
 
 $$
-F_{t+1:t+H}^{target}
-\approx
-\operatorname{shift}
-\left(
-\mu^{t-1}_{1:H}
-\right)
-+ K \epsilon_t
+F^{ref}_{t+1}
+=
+F_t + (F_t - F_{t-1})
 $$
 
-这个假设更适合动态接触任务，因为它允许未来力继续沿着任务进程演化，而不是被固定为当前力。
+这个约束只作用于 $F_\phi(o_t,a)_0$，远期动作仍由 base diffusion policy 决定。这样既利用了真实力反馈，又不假装知道整段未来力轨迹。
 
 ### 9.3 统一预测误差、方差和引导
 
@@ -325,7 +292,7 @@ $$
 \rightarrow
 \text{measurement}
 \rightarrow
-\text{residual update}
+    \text{proximal consistency}
 \rightarrow
 \text{corrected plan}
 $$
@@ -337,10 +304,10 @@ $$
 当前实现中：
 
 - `Policy` 保存上一轮完整的 `force_mu` 和 `force_log_sigma`。
-- 下一轮推理时，用当前真实力和上一轮第 0 步预测计算 `force_prediction_error`。
-- 同时构造 `force_target_mu` 和 `force_target_log_sigma`，传入 `sample_actions`。
+- 下一轮推理时，用当前真实力和上一轮第 0 步预测计算同时间步 `force_prediction_error`。
+- 同时将当前真实传感器力作为 observed force anchor，即 `force_target_mu = force[:, None, :]`，并使用上一轮第 0 步预测方差作为 `force_target_log_sigma`，传入 `sample_actions`。
 - `Pi0.sample_actions` 接收 `force_prediction_error`，并用它计算 $\lambda_t$。
-- `Pi0.sample_actions` 支持 `[B, F]` 和 `[B, H, F]` 两种 force target，因此可以做整段 horizon 的力轨迹引导。
+- `Pi0.sample_actions` 只对传入 target 的 horizon 范围计算 force NLL；CFRG 默认传入 `[B, 1, F]`，因此只约束第一个 force step。
 - `cst_tau` 保留为旧参数名兼容，但语义上应逐步替换为 `force_prediction_error`。
 
 ## 11. 可写进论文的方法名
@@ -355,11 +322,11 @@ $$
 
 一句话描述：
 
-CFRG uses the one-step force prediction residual as a causal feedback signal to adaptively guide action diffusion toward residual-corrected future force distributions.
+CFRG uses the one-step force prediction residual as a causal feedback signal to adaptively guide action diffusion with a proximal force-consistency energy.
 
 中文描述：
 
-CFRG 将上一轮力预测与当前真实力之间的差值视为因果力残差，用该残差自适应调节 diffusion 采样中的力引导强度，并校正未来力参考分布，从而实现无需未来真实力的闭环力引导。
+CFRG 将上一轮力预测与当前真实力之间的差值视为因果力残差，用该残差自适应调节 diffusion 采样中的近端力一致性约束，从而实现无需未来真实力的闭环力引导。
 
 ## 12. 建议实验
 
@@ -370,7 +337,7 @@ CFRG 将上一轮力预测与当前真实力之间的差值视为因果力残差
 - No force guidance：只使用基础 pi0。
 - Current-force guidance：把当前力 $F_t$ 当作未来目标。
 - Error-gated current-force guidance：用预测误差调节强度，但目标仍是当前力。
-- CFRG：使用 shift prediction + residual correction。
+- CFRG：使用 proximal force-consistency guidance。
 
 ### 12.2 指标
 
@@ -389,46 +356,44 @@ CFRG 将上一轮力预测与当前真实力之间的差值视为因果力残差
 
 - 真实力 $F_t$
 - 上一轮预测力 $\mu^{t-1}_{0}$
-- CFRG 校正后的未来力参考 $\tilde{\mu}^{t}_{0:H-1}$
+- 近端力参考 $F^{ref}_{t+1}$
 
 如果 CFRG 有效，应能看到：
 
 - 接触突变时 $r_t$ 上升。
 - $\lambda_t$ 随 $r_t$ 自适应增强。
-- 校正后的未来力参考比单纯当前力目标更平滑、更符合任务阶段。
+- 近端力参考随真实力趋势平滑变化，且只约束动作 chunk 前端。
 
 ## 13. 局限性
 
-CFRG 仍依赖力预测器 $F_\phi$ 的质量。如果 $F_\phi$ 学得不好，residual 和 future force reference 都会不可靠。
+CFRG 仍依赖力预测器 $F_\phi$ 的质量。如果 $F_\phi$ 学得不好，近端力一致性 energy 也会不可靠。
 
-此外，CFRG 默认当前 residual 可以对未来 horizon 产生近似平移式修正：
+此外，CFRG 使用一阶力趋势外推：
 
 $$
-\tilde{\mu}^{t}_{h}
+F^{ref}_{t+1}
 =
-\bar{\mu}^{t}_{h}
-+ K \epsilon_t
+F_t + (F_t - F_{t-1})
 $$
 
-这是一阶近似。对于高度非线性的接触动力学，可以进一步扩展为 learned correction：
+这是一阶近似。对于高度非线性的接触动力学，可以进一步扩展为 learned proximal reference：
 
 $$
-\Delta \mu_{0:H-1}
+F^{ref}_{t+1}
 =
 G_\psi
 \left(
 o_t,
 F_{t-L:t},
-\epsilon_t,
-\mu^{t-1}_{0:H-1}
+\epsilon_t
 \right)
 $$
 
-也就是说，可以训练一个小的 residual adapter，让模型学习不同任务阶段下 prediction residual 应该如何传播到未来力参考。
+也就是说，可以训练一个小的 residual adapter，让模型学习不同任务阶段下近端力参考应该如何由历史力和预测残差决定。
 
 ## 14. 总结
 
-CFRG 的核心贡献是把力引导从“使用当前力作为未来目标”改为“使用当前真实力校正上一轮未来力预测，并形成因果参考”。这样既保持因果性，又保留未来力轨迹的动态结构。
+CFRG 的核心贡献是把力引导从“使用当前力作为整段未来目标”改为“使用当前真实力残差门控近端力一致性”。这样既保持因果性，又符合 receding-horizon 执行机制。
 
 简洁公式为：
 
@@ -441,29 +406,24 @@ r_t = \epsilon_t^\top \left(\Sigma^{t-1}_{0}\right)^{-1} \epsilon_t
 $$
 
 $$
-\lambda_t = \lambda_{max} \operatorname{sigmoid}(k(r_t - \tau_0))
+\lambda_t = \lambda_{max}\frac{r_t}{r_t + d_f}
 $$
 
 $$
-\tilde{\mu}^{t}_{0:H-1}
+F^{ref}_{t+1}
 =
-\operatorname{shift}
-\left(
-\mu^{t-1}_{1:H}
-\right)
-+ K \cdot \operatorname{clip}(\epsilon_t)
+F_t + (F_t - F_{t-1})
 $$
 
 $$
 E_{CFRG}
 =
 \lambda_t
-\sum_{h=0}^{H-1}
 \operatorname{NLL}
 \left(
-\tilde{\mu}^{t}_{h};
-F_\phi(o_t, \hat{a}_0)_h
+F^{ref}_{t+1};
+F_\phi(o_t, \hat{a}_0)_0
 \right)
 $$
 
-这使力引导成为一个闭环、因果、可解释的 contact residual correction 模块。
+这使力引导成为一个闭环、因果、可解释的 proximal contact-consistency 模块。

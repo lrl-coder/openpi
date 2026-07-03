@@ -390,7 +390,7 @@
         <text x="1228" y="420" class="formula">  + λ(r) ∇_a log p(f_res|a_s)</text>
         <line x1="1228" y1="438" x2="1384" y2="438" stroke="#b7dec1" stroke-width="1.2"/>
         <circle cx="1229" cy="465" r="6" class="port port-red"/>
-        <text x="1244" y="469" class="tiny">residual-corrected μ, Σ</text>
+        <text x="1244" y="469" class="tiny">proximal force reference</text>
         <circle cx="1229" cy="492" r="6" class="port port-purple"/>
         <text x="1244" y="496" class="tiny">base velocity v_θ</text>
         <circle cx="1229" cy="519" r="6" class="port port-amber"/>
@@ -415,7 +415,7 @@
 
         <rect x="914" y="694" width="232" height="76" class="box green"/>
         <text x="942" y="724" class="small-title">Adaptive gate</text>
-        <text x="942" y="750" class="formula">λ(τ)=λ_max sigmoid(k(τ−τ₀))</text>
+        <text x="942" y="750" class="formula">λ(r)=λ_max r/(r+6)</text>
 
         <!-- Training objective -->
         <rect x="76" y="858" width="608" height="44" class="box slate"/>
@@ -461,7 +461,7 @@
       </svg>
 
       <div class="caption">
-        <strong>Figure.</strong> The diagram is organized as three non-overlapping flows. The semantic lane learns contact-aware representations from visual-language context and force-history supervision. The action lane uses a local force token to condition π0's action expert; the final action-token hidden states are read by both the flow head and <strong>F<sub>φ</sub></strong>. The runtime lane computes CFRG from measured force and the previous one-step prediction, producing <strong>λ(r)</strong> and a residual-corrected future force target that gates a force-guided flow term. Arrows converge only at the guided sampler, making the feedback structure explicit without clutter.
+        <strong>Figure.</strong> The diagram is organized as three non-overlapping flows. The semantic lane learns contact-aware representations from visual-language context and force-history supervision. The action lane uses a local force token to condition π0's action expert; the final action-token hidden states are read by both the flow head and <strong>F<sub>φ</sub></strong>. The runtime lane computes CFRG from measured force and the previous one-step prediction, producing <strong>λ(r)</strong> and a proximal force-consistency term that gates a force-guided flow update. Arrows converge only at the guided sampler, making the feedback structure explicit without clutter.
       </div>
     </section>
   </main>

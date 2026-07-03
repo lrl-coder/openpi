@@ -663,7 +663,7 @@
         <article class="node guidance">
           <div class="node-title"><span class="dot"></span>映射成引导强度</div>
           <p><code>r</code> 越大，force guidance 越强，但被 <code>lambda_max</code> 限幅。</p>
-          <div class="formula">lambda = lambda_max * sigmoid(k * (r - tau0))</div>
+          <div class="formula">lambda = lambda_max * r / (r + 6)</div>
         </article>
       </aside>
     </section>
@@ -681,7 +681,7 @@
       <div class="arrow" aria-hidden="true"></div>
       <article class="node compact red">
         <div class="node-title"><span class="dot"></span>周期 k+1 计算 CFRG</div>
-        <p>真实力偏离一步预测时，下一次采样循环中的梯度引导会被放大，并校正未来力目标。</p>
+        <p>真实力偏离一步预测时，下一次采样循环中的梯度引导会被放大，并增强观测力一致性约束。</p>
       </article>
     </section>
 
@@ -710,7 +710,7 @@
         <strong>核心直觉</strong>
         <p>
           推理阶段的力数据有两条通路：局部力历史直接作为 action expert 条件；CFRG 则用“上一周期一步预测力 vs 当前真实力”的残差，
-          构造残差校正后的未来力目标，并在采样循环里通过 <code>F_phi</code> 的 NLL 梯度修正 <code>v_t</code>。
+          门控以当前传感器力为锚点的近端一致性能量，并在采样循环里通过 <code>F_phi</code> 的 NLL 梯度修正 <code>v_t</code>。
         </p>
       </div>
     </aside>
