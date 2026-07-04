@@ -68,10 +68,17 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        force_attention_modulation_from_residual = self._sample_kwargs.pop(
+            "force_attention_modulation_from_residual", None
+        )
         force_guidance_from_residual = self._sample_kwargs.pop("force_guidance_from_residual", None)
         force_guidance_from_cst = self._sample_kwargs.pop("force_guidance_from_cst", False)
+        if force_attention_modulation_from_residual is None:
+            force_attention_modulation_from_residual = force_guidance_from_residual
         self._force_guidance_enabled = bool(
-            force_guidance_from_cst if force_guidance_from_residual is None else force_guidance_from_residual
+            force_guidance_from_cst
+            if force_attention_modulation_from_residual is None
+            else force_attention_modulation_from_residual
         )
         force_residual_window = self._sample_kwargs.pop("force_residual_window", 1)
         self._force_residual_window = max(1, int(force_residual_window))

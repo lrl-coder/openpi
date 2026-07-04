@@ -1,4 +1,4 @@
-# Force-Residual Token Routing (FRTR)
+# Force-Residual Attention Modulation (FRAM)
 
 ## 1. 核心问题
 
@@ -6,7 +6,7 @@
 
 > 模型先预测未来力序列；机器人执行动作后，力传感器会产生新的真实力数据。下一次推理时，我们比较已经执行时间步上的预测力和真实力。如果差距大，说明当前接触状态没有被上一轮动作预测解释，Action expert 应该更强地关注 force token。
 
-因此，这个模块的核心不是 tracking 一个手工力参考，而是 **用已发生的预测误差调节下一轮动作生成中的模态路由**。
+因此，这个模块的核心不是 tracking 一个手工力参考，而是 **用已发生的预测误差调制下一轮动作生成中 force token 的注意力强度**。
 
 这与三个已有研究脉络一致：
 
@@ -18,15 +18,15 @@
 
 建议将模块命名为：
 
-**Force-Residual Token Routing (FRTR)**
+**Force-Residual Attention Modulation (FRAM)**
 
 这个名字比旧名更准确，也更不容易引起误解：
 
 - **Force-Residual**：核心信号来自预测力和真实传感器力之间的时间对齐残差。
-- **Token**：被调制的是 Action expert 中的 force token，而不是动作本身被外部力目标强行拉动。
-- **Routing**：残差决定 Action expert 在下一轮推理中是否应该更依赖 force token。
+- **Attention**：模块目标是让 Action expert 在需要时更关注 force token。
+- **Modulation**：残差不是选择另一条路径，而是连续调制 force token 的条件强度。
 
-换句话说，FRTR 不是一个额外 controller，也不是一个 force target planner，而是一个基于接触预测误差的 token-level conditional routing 机制。
+换句话说，FRAM 不是一个额外 controller，也不是一个 force target planner，而是一个基于接触预测误差的 token-level attention modulation 机制。
 
 ## 3. $F_\phi$ 预测未来力序列
 
@@ -113,9 +113,9 @@ $$
 
 这正是 receding-horizon control 的自然闭环：预测、执行、观测、校正下一轮策略 [2,9]。
 
-## 5. 残差门控为 force-token routing
+## 5. 残差门控为 force attention modulation
 
-残差不再被用来构造 $F^{ref}$，也不再作为采样时 NLL 的目标。它只被转换为一个 force-token gate：
+残差不再被用来构造 $F^{ref}$，也不再作为采样时 NLL 的目标。它只被转换为一个 force attention modulation coefficient：
 
 $$
 g_{t+m}
@@ -128,13 +128,13 @@ r_{t+m}+d_f
 }
 $$
 
-其中 $d_f$ 是力/力矩维度，$g_{\max}$ 是最大 force-token amplification。这个形式有三个好处：
+其中 $d_f$ 是力/力矩维度，$g_{\max}$ 是最大 force-token attention amplification。这个形式有三个好处：
 
-- 不需要人工阈值。$r_{t+m}$ 接近 0 时，gate 自然接近 0。
-- 不需要 residual clip。大残差只会把 gate 饱和到 $g_{\max}$。
+- 不需要人工阈值。$r_{t+m}$ 接近 0 时，modulation 自然接近 0。
+- 不需要 residual clip。大残差只会把 modulation 饱和到 $g_{\max}$。
 - 尺度可解释。$d_f$ 对应标准化高斯残差的自然维度尺度。
 
-这个门控属于 conditional computation：网络不是一直强行依赖 force，而是在预测-观测失配时增加 force token 的路由权重。这一思想与 Sparsely-Gated MoE 中“输入决定激活哪些专家”一致 [8]，也与 GMU / FiLM 中“条件信号调制模态特征”的思想一致 [6,7]。
+这个门控属于 conditional modulation：网络不是一直强行依赖 force，而是在预测-观测失配时增加 force token 对 Action expert 的条件影响。这一思想与 GMU / FiLM 中“条件信号调制模态特征”的思想一致 [6,7]，也与 conditional computation 中根据输入动态改变计算/特征贡献的思想一致 [8]。
 
 ## 6. Action expert 如何更关注 force token
 
@@ -151,7 +151,7 @@ $$
 
 它被插入 Action expert 的 suffix tokens，使 state/action tokens 可以通过 attention 使用该接触信息。
 
-FRTR 在下一轮推理时不改变 VLM prefix，不改变语言，不改变动作 loss，也不额外构造力目标。它只调制 force token：
+FRAM 在下一轮推理时不改变 VLM prefix，不改变语言，不改变动作 loss，也不额外构造力目标。它只调制 force token：
 
 $$
 \tilde{z}^{force}_t
@@ -182,7 +182,7 @@ $$
 
 旧设计的问题是：一旦我们把当前真实力写进采样 NLL，就很容易被质疑为“是不是假设下一步力等于当前力”或“是不是构造了一个虚拟力目标”。新设计避免了这一点。
 
-FRTR 只回答一个问题：
+FRAM 只回答一个问题：
 
 $$
 \text{上一轮模型预测的接触后果可靠吗？}
@@ -190,7 +190,7 @@ $$
 
 如果可靠，force token 正常参与；如果不可靠，说明接触反馈比视觉/语言先验更重要，于是 Action expert 对 force token 的依赖增强。
 
-因此，它不是 controller，也不是目标力规划器，而是一个 **closed-loop modality router**。
+因此，它不是 controller，也不是目标力规划器，而是一个 **closed-loop force-attention modulator**。
 
 这个定位对审稿人更清楚：
 
@@ -209,7 +209,7 @@ $$
 2. **$F_\phi$ force consequence prediction**
    $F_\phi$ 预测动作 chunk 的未来力序列，训练时由真实未来力监督。这让模型知道“动作会造成什么接触后果”。
 
-3. **FRTR closed-loop force-token routing**
+3. **FRAM closed-loop force attention modulation**
    推理时，将已经执行时间步的真实力与上一轮预测力对齐比较。若残差大，则放大下一轮 force token，使 Action expert 在 denoising 中更关注接触反馈。
 
 链条如下：
@@ -223,18 +223,18 @@ F_\phi \text{ predicts future force sequence}
 \rightarrow
 \text{compare predicted vs observed force}
 \rightarrow
-\text{route Action expert toward force token}
+\text{modulate Action expert attention to force}
 $$
 
 ## 9. 推荐论文表述
 
 英文表述：
 
-> Force-Residual Token Routing (FRTR) is a causal token-level routing mechanism for contact-rich action generation. At each inference cycle, the policy predicts both an action chunk and its future force consequences. After executing the first few steps, the newly observed force measurements are aligned with the corresponding predicted force steps to compute a normalized force-residual score. Rather than constructing a future force target, FRTR converts this score into a routing gate that amplifies the local force token in the next Action Expert forward pass. The policy therefore attends more strongly to force feedback only when the previously predicted contact consequences disagree with the real sensor feedback.
+> Force-Residual Attention Modulation (FRAM) is a causal token-level modulation mechanism for contact-rich action generation. At each inference cycle, the policy predicts both an action chunk and its future force consequences. After executing the first few steps, the newly observed force measurements are aligned with the corresponding predicted force steps to compute a normalized force-residual score. Rather than constructing a future force target, FRAM converts this score into an attention modulation coefficient that amplifies the local force token in the next Action Expert forward pass. The policy therefore attends more strongly to force feedback only when the previously predicted contact consequences disagree with the real sensor feedback.
 
 中文表述：
 
-> Force-Residual Token Routing (FRTR) 是一个面向接触丰富动作生成的因果 token-level routing 机制。每次推理时，策略同时预测动作 chunk 及其未来力后果；执行前若干步后，新获得的真实力与对应预测力时间对齐，并计算标准化力残差。FRTR 不构造未来力目标，而是把该残差转换为 routing gate，在下一次 Action expert 前向中放大 local force token。这样，只有当上一轮预测接触后果与真实传感反馈不一致时，策略才会更强地关注力反馈。
+> Force-Residual Attention Modulation (FRAM) 是一个面向接触丰富动作生成的因果 token-level modulation 机制。每次推理时，策略同时预测动作 chunk 及其未来力后果；执行前若干步后，新获得的真实力与对应预测力时间对齐，并计算标准化力残差。FRAM 不构造未来力目标，而是把该残差转换为 attention modulation coefficient，在下一次 Action expert 前向中放大 local force token。这样，只有当上一轮预测接触后果与真实传感反馈不一致时，策略才会更强地关注力反馈。
 
 ## 10. 代码对应关系
 
@@ -245,8 +245,10 @@ $$
 - 如果部署侧只能提供当前力，则退化为 $m=1$ 的一拍闭环。
 - 如果部署侧提供最近执行窗口的 `force_history_local`，则可用窗口内的多个已执行步计算平均标准化残差。
 - `policy.py` 将标准化残差分数作为 `force_prediction_error` 传给 `sample_actions`。
-- `pi0.py` 将 `force_prediction_error` 映射为 `force_token_gate`，并在 `embed_suffix` 中调制 local force token：$\tilde{z}^{force}=(1+g)z^{force}$。
-- 旧的 `force_target_mu/log_sigma` 采样 NLL guidance 不再作为默认 FRTR 路径。
+- `pi0.py` 将 `force_prediction_error` 映射为 `force_attention_modulation`，并在 `embed_suffix` 中调制 local force token：$\tilde{z}^{force}=(1+g)z^{force}$。
+- 新配置字段使用 `force_attention_modulation_max` 表示最大 FRAM 强度；旧的 `force_guidance_lambda_max` 保留为兼容别名。
+- 推理启动时优先使用 `force_attention_modulation_from_residual`；旧的 `force_guidance_from_residual` 和 `force_guidance_from_cst` 保留为兼容别名。
+- 旧的 `force_target_mu/log_sigma` 采样 NLL guidance 不再作为默认 FRAM 路径。
 
 ## 11. 最终公式摘要
 
@@ -281,7 +283,7 @@ F^{obs}_{t+h}
 \right)
 $$
 
-force-token gate：
+force attention modulation：
 
 $$
 g_{t+m}
@@ -303,7 +305,7 @@ $$
 
 一句话总结：
 
-> FRTR 不再把残差变成力目标，而是把残差变成 Action expert 的 force-token routing signal。
+> FRAM 不再把残差变成力目标，而是把残差变成 Action expert 的 force-attention modulation signal。
 
 ## 12. 参考文献
 

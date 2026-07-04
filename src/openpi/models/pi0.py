@@ -185,7 +185,11 @@ class Pi0(_model.BaseModel):
         self.force_loss_weight = config.force_loss_weight
         self.force_target_loss_weight = config.force_target_loss_weight
         self.force_physical_loss_weight = config.force_physical_loss_weight
-        self.force_guidance_lambda_max = config.force_guidance_lambda_max
+        self.force_attention_modulation_max = (
+            config.force_attention_modulation_max
+            if config.force_attention_modulation_max is not None
+            else config.force_guidance_lambda_max
+        )
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -353,7 +357,7 @@ class Pi0(_model.BaseModel):
         loss = 1.0 - cosine
         return loss, cosine, query_feature
 
-    def _embed_force_local_token(self, obs: _model.Observation, dtype, force_token_gate=None):
+    def _embed_force_local_token(self, obs: _model.Observation, dtype, force_attention_modulation=None):
         force_history = self._force_history_or_current(obs, dtype, scope="local")
         hidden = self.force_local_conv1(force_history)
         hidden = self.force_local_norm1(hidden)
@@ -367,11 +371,11 @@ class Pi0(_model.BaseModel):
         pooled = jnp.mean(hidden, axis=1)
         pooled = self.force_local_out(pooled)
         pooled = nnx.swish(pooled)
-        if force_token_gate is not None:
-            gate = jnp.asarray(force_token_gate, dtype=pooled.dtype)
-            if gate.ndim == 0:
-                gate = jnp.broadcast_to(gate, (pooled.shape[0],))
-            pooled = pooled * (1.0 + gate[:, None])
+        if force_attention_modulation is not None:
+            modulation = jnp.asarray(force_attention_modulation, dtype=pooled.dtype)
+            if modulation.ndim == 0:
+                modulation = jnp.broadcast_to(modulation, (pooled.shape[0],))
+            pooled = pooled * (1.0 + modulation[:, None])
         return pooled[:, None, :]
 
     def _split_force_distribution(self, x):
@@ -388,11 +392,11 @@ class Pi0(_model.BaseModel):
         timestep: at.Float[at.Array, " b"],
         prefix_mask,
         kv_cache,
-        force_token_gate: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
+        force_attention_modulation: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
     ):
         batch_size = actions.shape[0]
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-            obs, actions, timestep, force_token_gate
+            obs, actions, timestep, force_attention_modulation
         )
         suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
         prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
@@ -598,7 +602,7 @@ class Pi0(_model.BaseModel):
         obs: _model.Observation,
         noisy_actions: _model.Actions,
         timestep: at.Float[at.Array, " b"],
-        force_token_gate: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
+        force_attention_modulation: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -609,7 +613,7 @@ class Pi0(_model.BaseModel):
         ar_mask = []
         tokens = []
         if self.force_guidance:
-            force_token = self._embed_force_local_token(obs, noisy_actions.dtype, force_token_gate)
+            force_token = self._embed_force_local_token(obs, noisy_actions.dtype, force_attention_modulation)
             tokens.append(force_token)
             input_mask.append(jnp.ones(force_token.shape[:2], dtype=jnp.bool_))
             # Local force history is a causal condition for state/action suffix tokens.
@@ -778,6 +782,8 @@ class Pi0(_model.BaseModel):
         force_prediction_error: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
         cst_tau: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
         force_guidance_lambda: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
+        force_attention_modulation: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
+        # Backward-compatible alias for the earlier force-token gate name.
         force_token_gate: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
         force_target_mu: at.Float[at.Array, "b f"] | at.Float[at.Array, "b ah f"] | None = None,
         force_target_log_sigma: at.Float[at.Array, "b f"] | at.Float[at.Array, "b ah f"] | None = None,
@@ -800,24 +806,26 @@ class Pi0(_model.BaseModel):
 
         force_error = force_prediction_error if force_prediction_error is not None else cst_tau
         if self.force_guidance:
-            if force_token_gate is None and force_guidance_lambda is not None:
-                force_token_gate = force_guidance_lambda
-            elif force_token_gate is None and force_error is not None:
+            if force_attention_modulation is None and force_token_gate is not None:
+                force_attention_modulation = force_token_gate
+            if force_attention_modulation is None and force_guidance_lambda is not None:
+                force_attention_modulation = force_guidance_lambda
+            elif force_attention_modulation is None and force_error is not None:
                 force_error = jnp.asarray(force_error, dtype=jnp.float32)
                 if force_error.ndim == 0:
                     force_error = jnp.broadcast_to(force_error, (batch_size,))
-                force_token_gate = self.force_guidance_lambda_max * (
+                force_attention_modulation = self.force_attention_modulation_max * (
                     force_error / (force_error + float(self.force_dim))
                 )
-            if force_token_gate is not None:
-                force_token_gate = jnp.asarray(force_token_gate, dtype=jnp.float32)
-                if force_token_gate.ndim == 0:
-                    force_token_gate = jnp.broadcast_to(force_token_gate, (batch_size,))
+            if force_attention_modulation is not None:
+                force_attention_modulation = jnp.asarray(force_attention_modulation, dtype=jnp.float32)
+                if force_attention_modulation.ndim == 0:
+                    force_attention_modulation = jnp.broadcast_to(force_attention_modulation, (batch_size,))
 
         def step(carry):
             x_t, time = carry
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size), force_token_gate
+                observation, x_t, jnp.broadcast_to(time, batch_size), force_attention_modulation
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other

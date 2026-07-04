@@ -28,7 +28,9 @@ class Checkpoint:
     config: str
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
-    # Enables CFRG from the previous force prediction residual.
+    # Enables FRAM from the previous force prediction residual.
+    force_attention_modulation_from_residual: bool = False
+    # Backward-compatible alias for older launch commands.
     force_guidance_from_residual: bool = False
     # Backward-compatible alias for older launch commands.
     force_guidance_from_cst: bool = False
@@ -98,8 +100,12 @@ def create_policy(args: Args) -> _policy.Policy:
                 args.policy.dir,
                 default_prompt=args.default_prompt,
                 sample_kwargs=(
-                    {"force_guidance_from_residual": True}
-                    if args.policy.force_guidance_from_residual or args.policy.force_guidance_from_cst
+                    {"force_attention_modulation_from_residual": True}
+                    if (
+                        args.policy.force_attention_modulation_from_residual
+                        or args.policy.force_guidance_from_residual
+                        or args.policy.force_guidance_from_cst
+                    )
                     else None
                 ),
             )
