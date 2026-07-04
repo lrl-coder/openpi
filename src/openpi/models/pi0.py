@@ -353,7 +353,7 @@ class Pi0(_model.BaseModel):
         loss = 1.0 - cosine
         return loss, cosine, query_feature
 
-    def _embed_force_local_token(self, obs: _model.Observation, dtype):
+    def _embed_force_local_token(self, obs: _model.Observation, dtype, force_token_gate=None):
         force_history = self._force_history_or_current(obs, dtype, scope="local")
         hidden = self.force_local_conv1(force_history)
         hidden = self.force_local_norm1(hidden)
@@ -367,6 +367,11 @@ class Pi0(_model.BaseModel):
         pooled = jnp.mean(hidden, axis=1)
         pooled = self.force_local_out(pooled)
         pooled = nnx.swish(pooled)
+        if force_token_gate is not None:
+            gate = jnp.asarray(force_token_gate, dtype=pooled.dtype)
+            if gate.ndim == 0:
+                gate = jnp.broadcast_to(gate, (pooled.shape[0],))
+            pooled = pooled * (1.0 + gate[:, None])
         return pooled[:, None, :]
 
     def _split_force_distribution(self, x):
@@ -383,9 +388,12 @@ class Pi0(_model.BaseModel):
         timestep: at.Float[at.Array, " b"],
         prefix_mask,
         kv_cache,
+        force_token_gate: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
     ):
         batch_size = actions.shape[0]
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(obs, actions, timestep)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+            obs, actions, timestep, force_token_gate
+        )
         suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
         prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
         full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
@@ -586,7 +594,11 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
+        force_token_gate: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -597,7 +609,7 @@ class Pi0(_model.BaseModel):
         ar_mask = []
         tokens = []
         if self.force_guidance:
-            force_token = self._embed_force_local_token(obs, noisy_actions.dtype)
+            force_token = self._embed_force_local_token(obs, noisy_actions.dtype, force_token_gate)
             tokens.append(force_token)
             input_mask.append(jnp.ones(force_token.shape[:2], dtype=jnp.bool_))
             # Local force history is a causal condition for state/action suffix tokens.
@@ -766,6 +778,7 @@ class Pi0(_model.BaseModel):
         force_prediction_error: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
         cst_tau: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
         force_guidance_lambda: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
+        force_token_gate: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
         force_target_mu: at.Float[at.Array, "b f"] | at.Float[at.Array, "b ah f"] | None = None,
         force_target_log_sigma: at.Float[at.Array, "b f"] | at.Float[at.Array, "b ah f"] | None = None,
     ) -> _model.Actions:
@@ -786,37 +799,25 @@ class Pi0(_model.BaseModel):
         )
 
         force_error = force_prediction_error if force_prediction_error is not None else cst_tau
-        enable_force_guidance = self.force_guidance and (force_error is not None or force_guidance_lambda is not None)
-        if enable_force_guidance:
-            if force_target_mu is None:
-                force_target_mu = self._current_real_force(observation, jnp.float32)
-            if force_target_log_sigma is None and force_target_mu is not None:
-                force_target_log_sigma = jnp.zeros_like(force_target_mu, dtype=jnp.float32)
-            enable_force_guidance = force_target_mu is not None and force_target_log_sigma is not None
-
-        if enable_force_guidance:
-            if force_guidance_lambda is None:
+        if self.force_guidance:
+            if force_token_gate is None and force_guidance_lambda is not None:
+                force_token_gate = force_guidance_lambda
+            elif force_token_gate is None and force_error is not None:
                 force_error = jnp.asarray(force_error, dtype=jnp.float32)
                 if force_error.ndim == 0:
                     force_error = jnp.broadcast_to(force_error, (batch_size,))
-                force_guidance_lambda = self.force_guidance_lambda_max * (
+                force_token_gate = self.force_guidance_lambda_max * (
                     force_error / (force_error + float(self.force_dim))
                 )
-            else:
-                force_guidance_lambda = jnp.asarray(force_guidance_lambda, dtype=jnp.float32)
-                if force_guidance_lambda.ndim == 0:
-                    force_guidance_lambda = jnp.broadcast_to(force_guidance_lambda, (batch_size,))
-            force_target_mu = jnp.asarray(force_target_mu, dtype=jnp.float32)
-            force_target_log_sigma = jnp.asarray(force_target_log_sigma, dtype=jnp.float32)
-            if force_target_mu.ndim == 2:
-                force_target_mu = force_target_mu[:, None, :]
-            if force_target_log_sigma.ndim == 2:
-                force_target_log_sigma = force_target_log_sigma[:, None, :]
+            if force_token_gate is not None:
+                force_token_gate = jnp.asarray(force_token_gate, dtype=jnp.float32)
+                if force_token_gate.ndim == 0:
+                    force_token_gate = jnp.broadcast_to(force_token_gate, (batch_size,))
 
         def step(carry):
             x_t, time = carry
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                observation, x_t, jnp.broadcast_to(time, batch_size), force_token_gate
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
@@ -844,33 +845,6 @@ class Pi0(_model.BaseModel):
             )
             assert step_prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-
-            if enable_force_guidance:
-                assert force_target_mu is not None
-                assert force_target_log_sigma is not None
-                base_v_t = jax.lax.stop_gradient(v_t)
-
-                def guidance_nll(action_sample):
-                    clean_action_estimate = action_sample - time * base_v_t
-                    force_mu, _ = self._predict_force_from_action_head(
-                        observation,
-                        clean_action_estimate,
-                        prefix_mask,
-                        kv_cache,
-                        jnp.zeros((batch_size,), dtype=clean_action_estimate.dtype),
-                    )
-                    target_horizon = force_target_mu.shape[1]
-                    nll = self._diag_gaussian_nll(
-                        force_target_mu,
-                        force_mu[:, :target_horizon, :],
-                        force_target_log_sigma,
-                    )
-                    return jnp.sum(nll * force_guidance_lambda[:, None])
-
-                guidance_grad = jax.grad(guidance_nll)(x_t)
-                # The sampler integrates from t=1 to t=0 with negative dt, while v_t predicts noise - action.
-                # Adding grad(NLL) to this velocity moves the clean-action estimate down the NLL gradient.
-                v_t = v_t + guidance_grad
 
             return x_t + dt * v_t, time + dt
 

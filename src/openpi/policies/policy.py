@@ -21,6 +21,20 @@ from openpi.shared import nnx_utils
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
 
+def _pad_or_trim_force_history(history: np.ndarray, current_force: np.ndarray, target_len: int) -> np.ndarray:
+    history = np.asarray(history)
+    if history.ndim == 1:
+        history = history[None, :]
+    if history.shape[0] == 0:
+        history = current_force[None, :]
+    if history.shape[0] < target_len:
+        pad = np.repeat(history[:1], target_len - history.shape[0], axis=0)
+        history = np.concatenate([pad, history], axis=0)
+    elif history.shape[0] > target_len:
+        history = history[-target_len:]
+    return history
+
+
 class Policy(BasePolicy):
     def __init__(
         self,
@@ -59,6 +73,8 @@ class Policy(BasePolicy):
         self._force_guidance_enabled = bool(
             force_guidance_from_cst if force_guidance_from_residual is None else force_guidance_from_residual
         )
+        force_residual_window = self._sample_kwargs.pop("force_residual_window", 1)
+        self._force_residual_window = max(1, int(force_residual_window))
         self._force_model_enabled = bool(getattr(model, "force_guidance", False))
         self._prev_force_mu = None
         self._prev_force_log_sigma = None
@@ -100,17 +116,31 @@ class Policy(BasePolicy):
         inputs = self._input_transform(inputs)
         if self._force_model_enabled and not self._is_pytorch_model and "force" in inputs:
             current_force = np.asarray(inputs["force"])
-            if self._force_history_global is None:
+            provided_force_history_global = inputs.get("force_history_global")
+            provided_force_history_local = inputs.get("force_history_local", inputs.get("force_history"))
+
+            if provided_force_history_global is not None:
+                self._force_history_global = _pad_or_trim_force_history(
+                    provided_force_history_global, current_force, self._force_history_global_len
+                )
+            elif self._force_history_global is None:
                 self._force_history_global = np.repeat(
                     current_force[None, :], self._force_history_global_len, axis=0
-                )
-                self._force_history_local = np.repeat(
-                    current_force[None, :], self._force_history_local_len, axis=0
                 )
             else:
                 self._force_history_global = np.concatenate(
                     [self._force_history_global[1:], current_force[None, :]], axis=0
                 )
+
+            if provided_force_history_local is not None:
+                self._force_history_local = _pad_or_trim_force_history(
+                    provided_force_history_local, current_force, self._force_history_local_len
+                )
+            elif self._force_history_local is None:
+                self._force_history_local = np.repeat(
+                    current_force[None, :], self._force_history_local_len, axis=0
+                )
+            else:
                 self._force_history_local = np.concatenate(
                     [self._force_history_local[1:], current_force[None, :]], axis=0
                 )
@@ -134,16 +164,26 @@ class Policy(BasePolicy):
                 force = jnp.asarray(force)
                 prev_mu = jnp.asarray(self._prev_force_mu)
                 prev_log_sigma = jnp.asarray(self._prev_force_log_sigma)
-                one_step_mu = prev_mu[:, 0, :] if prev_mu.ndim == 3 else prev_mu
-                one_step_log_sigma = prev_log_sigma[:, 0, :] if prev_log_sigma.ndim == 3 else prev_log_sigma
-                residual = force - one_step_mu
-                inv_var = jnp.exp(-2.0 * one_step_log_sigma)
-                sample_kwargs["force_prediction_error"] = jnp.sum(jnp.square(residual) * inv_var, axis=-1)
+                if prev_mu.ndim == 3:
+                    force_history = inputs.get("force_history_local")
+                    if force_history is not None:
+                        window = min(self._force_residual_window, prev_mu.shape[1], force_history.shape[1])
+                        observed_force = force_history[:, -window:, :]
+                        pred_mu = prev_mu[:, :window, :]
+                        pred_log_sigma = prev_log_sigma[:, :window, :]
+                    else:
+                        observed_force = force[:, None, :]
+                        pred_mu = prev_mu[:, :1, :]
+                        pred_log_sigma = prev_log_sigma[:, :1, :]
+                else:
+                    observed_force = force[:, None, :]
+                    pred_mu = prev_mu[:, None, :]
+                    pred_log_sigma = prev_log_sigma[:, None, :]
 
-                # The previous one-step prediction and the current sensor reading refer to the same physical time.
-                # Use the observed force as the proximal sensor anchor; do not extrapolate force dynamics.
-                sample_kwargs["force_target_mu"] = force[:, None, :]
-                sample_kwargs["force_target_log_sigma"] = one_step_log_sigma[:, None, :]
+                residual = observed_force - pred_mu
+                inv_var = jnp.exp(-2.0 * pred_log_sigma)
+                per_step_error = jnp.sum(jnp.square(residual) * inv_var, axis=-1)
+                sample_kwargs["force_prediction_error"] = jnp.mean(per_step_error, axis=-1)
 
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
