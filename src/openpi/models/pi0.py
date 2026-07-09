@@ -382,7 +382,10 @@ class Pi0(_model.BaseModel):
         mu, log_sigma = jnp.split(x.astype(jnp.float32), 2, axis=-1)
         return mu, jnp.clip(log_sigma, -5.0, 3.0)
 
-    def _decode_force_from_action_features(self, action_features):
+    def _decode_force_from_action_features(self, action_features, action_hat_0=None):
+        if action_hat_0 is not None:
+            action_hat_tokens = self.action_in_proj(action_hat_0.astype(action_features.dtype))
+            action_features = action_features + action_hat_tokens
         return self._split_force_distribution(self.force_predictor_out(action_features))
 
     def _action_features_from_prefix_cache(
@@ -429,7 +432,7 @@ class Pi0(_model.BaseModel):
         if timestep is None:
             timestep = jnp.zeros((actions.shape[0],), dtype=actions.dtype)
         action_features = self._action_features_from_prefix_cache(obs, actions, timestep, prefix_mask, kv_cache)
-        return self._decode_force_from_action_features(action_features)
+        return self._decode_force_from_action_features(action_features, actions)
 
     def _diag_gaussian_nll(self, target, mu, log_sigma):
         log_sigma = jnp.clip(log_sigma, -5.0, 3.0)
@@ -541,7 +544,7 @@ class Pi0(_model.BaseModel):
             prefix_mask,
             kv_cache,
         )
-        force_mu, force_log_sigma = self._decode_force_from_action_features(clean_action_features)
+        force_mu, force_log_sigma = self._decode_force_from_action_features(clean_action_features, actions)
         force_log_sigma = jnp.clip(force_log_sigma, -5.0, 3.0)
         query_feature = self._semantic_force_query_feature(prefix_out)
         force_feature = self._encode_force_semantic_feature(observation, prefix_out.dtype)
@@ -687,7 +690,7 @@ class Pi0(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # Fill the prefix KV cache once. The action head and F_phi both decode from suffix hidden features.
+        # Fill the prefix KV cache once. The action head and F_phi decode from the same denoising suffix features.
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
@@ -704,20 +707,9 @@ class Pi0(_model.BaseModel):
         if not self.force_guidance:
             return loss, info
 
-        clean_action_features = None
-        needs_clean_action_features = self.force_loss_weight > 0.0 and observation.force_targets is not None
-        if needs_clean_action_features:
-            clean_action_features = self._action_features_from_prefix_cache(
-                observation,
-                actions,
-                jnp.zeros((actions.shape[0],), dtype=actions.dtype),
-                prefix_mask,
-                kv_cache,
-            )
-
         if self.force_loss_weight > 0.0 and observation.force_targets is not None:
-            assert clean_action_features is not None
-            force_mu, force_log_sigma = self._decode_force_from_action_features(clean_action_features)
+            action_hat_0 = jax.lax.stop_gradient(x_t - time_expanded * v_t)
+            force_mu, force_log_sigma = self._decode_force_from_action_features(action_features, action_hat_0)
             force_loss = self._diag_gaussian_nll(observation.force_targets, force_mu, force_log_sigma)
             loss = loss + self.force_loss_weight * force_loss
             if return_info:
