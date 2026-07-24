@@ -1,5 +1,9 @@
 # Force-Residual Attention Modulation (FRAM) 推理使用说明
 
+> 分支差异：`action-expert-current-force-L2-loss` 中 local force token 已改为当前
+> 瞬时力的线性投影，闭环 residual 也改为不含 `log_sigma` 的普通 MSE。详见
+> [action_expert_current_force_l2.md](action_expert_current_force_l2.md)。
+
 ## 1. 一句话说明
 
 FRAM 只在推理闭环中启用。它会缓存上一轮动作对应的未来力预测序列；下一轮收到新的真实力传感器数据后，比较“已经执行时间步”的预测力和真实力。如果残差大，就在本轮 Action expert 前向中增强 local force token，使动作生成更关注力反馈。

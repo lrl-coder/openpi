@@ -3,8 +3,8 @@
 The script reads metrics.csv and writes:
   - report.md: human-readable summary and diagnostics
   - key_metrics_summary.csv: first/final/min/max/delta for important metrics
-  - axis_variance_summary.csv: per-axis force variance calibration at the final row
-  - plots/*.png: loss, calibration, variance-gap, and log-sigma trend plots
+  - axis_variance_summary.csv: per-axis force prediction statistics at the final row
+  - plots/*.png: loss, residual, and prediction-variance trend plots
 """
 
 from __future__ import annotations
@@ -31,10 +31,9 @@ KEY_METRICS = [
     "loss",
     "diagnostic_loss",
     "loss_fm",
-    "force_nll",
-    "force_target_nll",
+    "force_l2",
+    "loss_force_l2",
     "loss_force_weighted",
-    "loss_force_target_weighted",
     "loss_force_physical_anchor",
     "loss_force_physical_anchor_weighted",
     "loss_force_distill",
@@ -48,18 +47,13 @@ KEY_METRICS = [
     "force_physical_summary_target_std_mean",
     "force_physical_summary_pred_std_mean",
     "grad_norm",
-    "force_pred_sigma_mean",
-    "force_pred_sigma_to_true_std_ratio_mean",
-    "force_pred_var_abs_gap_mean",
-    "force_pred_var_abs_gap_within_horizon_mean",
-    "force_pred_var_to_residual_mse_ratio_mean",
-    "force_residual_rmse_to_pred_sigma_ratio_mean",
-    "force_target_pred_sigma_mean",
-    "force_target_pred_sigma_to_true_std_ratio_mean",
-    "force_target_pred_var_abs_gap_mean",
-    "force_target_pred_var_abs_gap_within_horizon_mean",
-    "force_target_pred_var_to_residual_mse_ratio_mean",
-    "force_target_residual_rmse_to_pred_sigma_ratio_mean",
+    "force_residual_mse_mean",
+    "force_residual_rmse_mean",
+    "force_residual_mae_mean",
+    "force_prediction_batch_var_mean",
+    "force_true_var_mean",
+    "force_prediction_var_abs_gap_mean",
+    "force_prediction_var_abs_gap_within_horizon_mean",
 ]
 
 PLOT_GROUPS = {
@@ -67,8 +61,8 @@ PLOT_GROUPS = {
         "loss",
         "diagnostic_loss",
         "loss_fm",
+        "loss_force_l2",
         "loss_force_weighted",
-        "loss_force_target_weighted",
         "loss_force_physical_anchor_weighted",
         "loss_force_distill_weighted",
         "loss_force_semantic_align_weighted",
@@ -82,47 +76,21 @@ PLOT_GROUPS = {
         "force_physical_summary_target_std_mean",
         "force_physical_summary_pred_std_mean",
     ],
-    "force_nll": [
-        "force_nll",
-        "force_target_nll",
-        "force_nll_negative_frac",
-        "force_target_nll_negative_frac",
+    "force_l2": [
+        "force_l2",
+        "force_residual_mse_mean",
+        "force_residual_rmse_mean",
+        "force_residual_mae_mean",
     ],
-    "force_predictor_calibration": [
-        "force_pred_sigma_to_true_std_ratio_mean",
-        "force_pred_var_to_residual_mse_ratio_mean",
-        "force_residual_rmse_to_pred_sigma_ratio_mean",
-    ],
-    "force_target_calibration": [
-        "force_target_pred_sigma_to_true_std_ratio_mean",
-        "force_target_pred_var_to_residual_mse_ratio_mean",
-        "force_target_residual_rmse_to_pred_sigma_ratio_mean",
-    ],
-    "variance_abs_gap": [
-        "force_pred_var_abs_gap_mean",
-        "force_pred_var_abs_gap_within_horizon_mean",
-        "force_target_pred_var_abs_gap_mean",
-        "force_target_pred_var_abs_gap_within_horizon_mean",
-    ],
-    "log_sigma_ranges": [
-        "force_pred_log_sigma_min",
-        "force_pred_log_sigma_mean",
-        "force_pred_log_sigma_max",
-        "force_target_pred_log_sigma_min",
-        "force_target_pred_log_sigma_mean",
-        "force_target_pred_log_sigma_max",
-    ],
-    "clip_fractions": [
-        "force_pred_log_sigma_min_clip_frac",
-        "force_pred_log_sigma_max_clip_frac",
-        "force_target_pred_log_sigma_min_clip_frac",
-        "force_target_pred_log_sigma_max_clip_frac",
+    "prediction_variance": [
+        "force_prediction_batch_var_mean",
+        "force_true_var_mean",
+        "force_prediction_var_abs_gap_mean",
+        "force_prediction_var_abs_gap_within_horizon_mean",
     ],
     "true_variance": [
         "force_true_var_mean",
         "force_true_var_within_horizon_mean",
-        "force_target_true_var_mean",
-        "force_target_true_var_within_horizon_mean",
     ],
 }
 
@@ -199,25 +167,24 @@ def make_metric_summary(df: pd.DataFrame, last_k: int) -> pd.DataFrame:
 def axis_variance_summary(df: pd.DataFrame) -> pd.DataFrame:
     final = df.iloc[-1]
     rows = []
-    for prefix in ["force", "force_target"]:
-        pred_prefix = "force_pred" if prefix == "force" else "force_target_pred"
-        true_prefix = "force_true" if prefix == "force" else "force_target_true"
-        for axis in range(6):
-            row = {"head": prefix, "axis": axis}
-            for name, col in [
-                ("pred_var", f"{pred_prefix}_var_axis_{axis}"),
-                ("true_var", f"{true_prefix}_var_axis_{axis}"),
-                ("var_gap", f"{pred_prefix}_var_minus_true_var_axis_{axis}"),
-                ("true_var_within_horizon", f"{true_prefix}_var_within_horizon_axis_{axis}"),
-                ("var_gap_within_horizon", f"{pred_prefix}_var_minus_true_var_within_horizon_axis_{axis}"),
-                ("residual_mse", f"{prefix}_residual_mse_axis_{axis}"),
-            ]:
-                row[name] = float(final[col]) if col in df.columns and pd.notna(final[col]) else np.nan
-            if np.isfinite(row["pred_var"]) and np.isfinite(row["true_var"]) and row["true_var"] > 0:
-                row["pred_var_to_true_var"] = row["pred_var"] / row["true_var"]
-            else:
-                row["pred_var_to_true_var"] = np.nan
-            rows.append(row)
+    for axis in range(6):
+        row = {"head": "force", "axis": axis}
+        for name, col in [
+            ("pred_var", f"force_prediction_batch_var_axis_{axis}"),
+            ("true_var", f"force_true_var_axis_{axis}"),
+            ("var_gap", f"force_prediction_var_minus_true_var_axis_{axis}"),
+            ("true_var_within_horizon", f"force_true_var_within_horizon_axis_{axis}"),
+            ("var_gap_within_horizon", f"force_prediction_var_minus_true_var_within_horizon_axis_{axis}"),
+            ("residual_mse", f"force_residual_mse_axis_{axis}"),
+            ("residual_rmse", f"force_residual_rmse_axis_{axis}"),
+            ("residual_mae", f"force_residual_mae_axis_{axis}"),
+        ]:
+            row[name] = float(final[col]) if col in df.columns and pd.notna(final[col]) else np.nan
+        if np.isfinite(row["pred_var"]) and np.isfinite(row["true_var"]) and row["true_var"] > 0:
+            row["pred_var_to_true_var"] = row["pred_var"] / row["true_var"]
+        else:
+            row["pred_var_to_true_var"] = np.nan
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -244,7 +211,7 @@ def plot_series(df: pd.DataFrame, columns: list[str], path: Path, title: str, sm
 
 def plot_axis_bars(axis_df: pd.DataFrame, out_dir: Path) -> list[Path]:
     paths = []
-    for head in ["force", "force_target"]:
+    for head in ["force"]:
         sub = axis_df[axis_df["head"] == head]
         if sub.empty:
             continue
@@ -256,7 +223,7 @@ def plot_axis_bars(axis_df: pd.DataFrame, out_dir: Path) -> list[Path]:
         plt.bar(x + width / 2, sub["true_var"], width, label="true_var")
         plt.xticks(x, [f"axis_{int(a)}" for a in sub["axis"]])
         plt.ylabel("variance")
-        plt.title(f"{head}: final predicted variance vs true variance")
+        plt.title(f"{head}: final prediction batch variance vs true variance")
         plt.grid(True, axis="y", alpha=0.25)
         plt.legend()
         plt.tight_layout()
@@ -295,16 +262,10 @@ def markdown_table(df: pd.DataFrame, *, floatfmt: str = ".5g") -> str:
                 values.append(str(value))
         rows.append(values)
 
-    widths = [
-        max(len(columns[i]), *(len(row[i]) for row in rows))
-        for i in range(len(columns))
-    ]
+    widths = [max(len(columns[i]), *(len(row[i]) for row in rows)) for i in range(len(columns))]
     header = "| " + " | ".join(columns[i].ljust(widths[i]) for i in range(len(columns))) + " |"
     sep = "| " + " | ".join("-" * widths[i] for i in range(len(columns))) + " |"
-    body = [
-        "| " + " | ".join(row[i].ljust(widths[i]) for i in range(len(columns))) + " |"
-        for row in rows
-    ]
+    body = ["| " + " | ".join(row[i].ljust(widths[i]) for i in range(len(columns))) + " |" for row in rows]
     return "\n".join([header, sep, *body])
 
 
@@ -349,37 +310,19 @@ def build_report(
             lines.append(f"- `{col}` changed by {pct:.2f}% from first to final logged row.")
         lines.append("")
 
-    lines.append("## Force Predictor Calibration")
+    lines.append("## Force Predictor L2 Diagnostics")
     for col in existing(
         df,
         [
-            "force_nll",
-            "force_nll_negative_frac",
-            "force_pred_sigma_to_true_std_ratio_mean",
-            "force_pred_var_abs_gap_mean",
-            "force_pred_var_abs_gap_within_horizon_mean",
-            "force_pred_var_to_residual_mse_ratio_mean",
-            "force_residual_rmse_to_pred_sigma_ratio_mean",
-            "force_pred_log_sigma_min_clip_frac",
-            "force_pred_log_sigma_max_clip_frac",
-        ],
-    ):
-        lines.append(f"- `{col}`: {describe_metric(df, col)}")
-    lines.append("")
-
-    lines.append("## VLM Force Target Calibration")
-    for col in existing(
-        df,
-        [
-            "force_target_nll",
-            "force_target_nll_negative_frac",
-            "force_target_pred_sigma_to_true_std_ratio_mean",
-            "force_target_pred_var_abs_gap_mean",
-            "force_target_pred_var_abs_gap_within_horizon_mean",
-            "force_target_pred_var_to_residual_mse_ratio_mean",
-            "force_target_residual_rmse_to_pred_sigma_ratio_mean",
-            "force_target_pred_log_sigma_min_clip_frac",
-            "force_target_pred_log_sigma_max_clip_frac",
+            "force_l2",
+            "loss_force_l2",
+            "force_residual_mse_mean",
+            "force_residual_rmse_mean",
+            "force_residual_mae_mean",
+            "force_prediction_batch_var_mean",
+            "force_true_var_mean",
+            "force_prediction_var_abs_gap_mean",
+            "force_prediction_var_abs_gap_within_horizon_mean",
         ],
     ):
         lines.append(f"- `{col}`: {describe_metric(df, col)}")
@@ -388,43 +331,15 @@ def build_report(
     warnings = []
     add_warning(
         warnings,
-        "force_pred_log_sigma_min_clip_frac" in df.columns
-        and float(final["force_pred_log_sigma_min_clip_frac"]) > 0.05,
-        "`F_phi` log_sigma is often clipped at the lower bound; predicted force variance may be collapsing.",
+        "force_prediction_batch_var_mean" in df.columns
+        and "force_true_var_mean" in df.columns
+        and float(final["force_prediction_batch_var_mean"]) < 0.1 * max(float(final["force_true_var_mean"]), 1e-12),
+        "`F_phi` prediction variance is below 10% of target variance; the L2 predictor may be collapsing to a mean.",
     )
     add_warning(
         warnings,
-        "force_target_pred_log_sigma_min_clip_frac" in df.columns
-        and float(final["force_target_pred_log_sigma_min_clip_frac"]) > 0.05,
-        "VLM target log_sigma is often clipped at the lower bound; target variance may be collapsing.",
-    )
-    add_warning(
-        warnings,
-        "force_pred_sigma_to_true_std_ratio_mean" in df.columns
-        and float(final["force_pred_sigma_to_true_std_ratio_mean"]) < 0.3,
-        "`F_phi` predicted std is less than 30% of the batch true std.",
-    )
-    add_warning(
-        warnings,
-        "force_target_pred_sigma_to_true_std_ratio_mean" in df.columns
-        and float(final["force_target_pred_sigma_to_true_std_ratio_mean"]) < 0.3,
-        "VLM target predicted std is less than 30% of the true target std.",
-    )
-    add_warning(
-        warnings,
-        "force_residual_rmse_to_pred_sigma_ratio_mean" in df.columns
-        and float(final["force_residual_rmse_to_pred_sigma_ratio_mean"]) > 2.0,
-        "`F_phi` residual RMSE is more than 2x predicted sigma; uncertainty may be under-estimated.",
-    )
-    add_warning(
-        warnings,
-        "force_target_residual_rmse_to_pred_sigma_ratio_mean" in df.columns
-        and float(final["force_target_residual_rmse_to_pred_sigma_ratio_mean"]) > 2.0,
-        "VLM target residual RMSE is more than 2x predicted sigma; target uncertainty may be under-estimated.",
-    )
-    add_warning(
-        warnings,
-        "grad_norm" in df.columns and float(df["grad_norm"].max()) > 10 * max(float(stable["grad_norm"].median()), 1e-12),
+        "grad_norm" in df.columns
+        and float(df["grad_norm"].max()) > 10 * max(float(stable["grad_norm"].median()), 1e-12),
         "Large early/isolated grad_norm spike detected. Check whether this is just step-0 warmup or persistent instability.",
     )
     nan_cols = [col for col in df.columns if df[col].isna().any()]
@@ -434,7 +349,7 @@ def build_report(
     if warnings:
         lines.extend(warnings)
     else:
-        lines.append("- No obvious variance-collapse or numeric warning from the configured checks.")
+        lines.append("- No obvious prediction-collapse or numeric warning from the configured checks.")
     lines.append("")
 
     if not axis_df.empty:

@@ -1,9 +1,21 @@
+import jax.numpy as jnp
+import numpy as np
 from openpi_client import action_chunk_broker
 import pytest
 
 from openpi.policies import aloha_policy
+from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.training import config as _config
+
+
+def test_mean_squared_force_residual():
+    observed = jnp.array([[[1.0, 2.0], [4.0, 6.0]]])
+    predicted = jnp.array([[[0.0, 0.0], [2.0, 2.0]]])
+
+    residual = _policy._mean_squared_force_residual(observed, predicted)  # noqa: SLF001
+
+    np.testing.assert_allclose(residual, np.array([[2.5, 10.0]]))
 
 
 @pytest.mark.manual

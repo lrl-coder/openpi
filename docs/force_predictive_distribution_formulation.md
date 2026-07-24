@@ -1,5 +1,9 @@
 # 如何表述 $F_\phi$ 的逐时间步力预测分布
 
+> 历史记录：本文保留 Gaussian NLL 方案的推导。当前
+> `action-expert-current-force-L2-loss` 分支采用确定性力点预测与 L2 损失，
+> 详见 [action_expert_current_force_l2.md](action_expert_current_force_l2.md)。
+
 ## 1. 代码事实
 
 当前实现中，$F_\phi$ 挂在 action expert 的 action-token hidden features 后面。对于一个长度为 $H$ 的动作 chunk，action expert 会输出 $H$ 个 action-token hidden states：

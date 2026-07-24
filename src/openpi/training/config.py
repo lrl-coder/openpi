@@ -83,7 +83,9 @@ class FlexivPumpInputs(_transforms.DataTransformFn):
         force_history_local = _left_pad_or_trim_history(force_history, self.force_history_local_len)
         inputs["force_history_global"] = force_history_global
         inputs["force_history_local"] = force_history_local
-        # Compatibility alias for older analysis/debug tools. The model now prefers global/local histories.
+        # Compatibility inputs for residual-window analysis and older checkpoints.
+        # The current action expert consumes only `force`; the semantic teacher uses
+        # `force_history_global`.
         inputs["force_history"] = force_history_local
 
         if future_states is not None and "actions" in inputs:
@@ -623,9 +625,7 @@ def _flexiv_pump_data_config(
             split="train",
             prompt_from_task=True,
             action_sequence_keys=("action",),
-            extra_delta_timestamp_steps={
-                "observation.state": tuple(range(-(force_history_global_len - 1), 51))
-            }
+            extra_delta_timestamp_steps={"observation.state": tuple(range(-(force_history_global_len - 1), 51))}
             if force_guided
             else {},
             derive_force_norm_stats_from_state=force_guided,

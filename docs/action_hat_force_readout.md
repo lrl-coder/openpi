@@ -1,5 +1,9 @@
 # Action-Hat Force Readout
 
+> 历史记录：本文描述上一版 `F_phi` 的 Gaussian NLL 实现。当前
+> `action-expert-current-force-L2-loss` 分支已将其替换为点预测与 L2 损失，
+> 详见 [action_expert_current_force_l2.md](action_expert_current_force_l2.md)。
+
 本文记录当前 `F_phi` 的训练路径改动：训练时不再为了 force NLL 额外跑一次
 `ActionExpert(obs, action_gt, t=0)`，而是复用 flow matching 的 denoising pass，
 从模型当前预测的 clean action estimate 上做 force consequence readout。
@@ -109,4 +113,3 @@ h_t, v_t -> action_hat_0 -> F_phi(h_t, action_hat_0)
 ```
 
 不需要再额外跑 clean action expert pass。
-

@@ -1,5 +1,10 @@
 # flexiv_pump_1bottle_inputForce 微调 pi0_base
 
+> 分支差异：`action-expert-current-force-L2-loss` 已将 action expert 的局部历史力
+> TCN 替换为当前瞬时力 Linear，并将 `F_phi` 的 Gaussian NLL 替换为 L2。
+> 本文中的旧 NLL/`log_sigma` 章节仅作历史参考；当前实现以
+> [action_expert_current_force_l2.md](action_expert_current_force_l2.md) 为准。
+
 本文档记录当前机器上使用 openpi 微调 `pi0_base` 的运行方式。数据集已经是 LeRobot dataset 格式：
 
 ```text

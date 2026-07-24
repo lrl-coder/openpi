@@ -35,6 +35,11 @@ def _pad_or_trim_force_history(history: np.ndarray, current_force: np.ndarray, t
     return history
 
 
+def _mean_squared_force_residual(observed_force, predicted_force):
+    """Returns one unweighted L2 residual score per batch/time entry."""
+    return jnp.mean(jnp.square(observed_force - predicted_force), axis=-1)
+
+
 class Policy(BasePolicy):
     def __init__(
         self,
@@ -83,8 +88,7 @@ class Policy(BasePolicy):
         force_residual_window = self._sample_kwargs.pop("force_residual_window", 1)
         self._force_residual_window = max(1, int(force_residual_window))
         self._force_model_enabled = bool(getattr(model, "force_guidance", False))
-        self._prev_force_mu = None
-        self._prev_force_log_sigma = None
+        self._prev_force_prediction = None
         self._force_history_global = None
         self._force_history_local = None
         model_config = getattr(model, "config", None)
@@ -113,8 +117,7 @@ class Policy(BasePolicy):
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         if bool(np.asarray(obs.get("reset", False))):
-            self._prev_force_mu = None
-            self._prev_force_log_sigma = None
+            self._prev_force_prediction = None
             self._force_history_global = None
             self._force_history_local = None
 
@@ -131,9 +134,7 @@ class Policy(BasePolicy):
                     provided_force_history_global, current_force, self._force_history_global_len
                 )
             elif self._force_history_global is None:
-                self._force_history_global = np.repeat(
-                    current_force[None, :], self._force_history_global_len, axis=0
-                )
+                self._force_history_global = np.repeat(current_force[None, :], self._force_history_global_len, axis=0)
             else:
                 self._force_history_global = np.concatenate(
                     [self._force_history_global[1:], current_force[None, :]], axis=0
@@ -144,9 +145,7 @@ class Policy(BasePolicy):
                     provided_force_history_local, current_force, self._force_history_local_len
                 )
             elif self._force_history_local is None:
-                self._force_history_local = np.repeat(
-                    current_force[None, :], self._force_history_local_len, axis=0
-                )
+                self._force_history_local = np.repeat(current_force[None, :], self._force_history_local_len, axis=0)
             else:
                 self._force_history_local = np.concatenate(
                     [self._force_history_local[1:], current_force[None, :]], axis=0
@@ -165,31 +164,29 @@ class Policy(BasePolicy):
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
-        if self._force_guidance_enabled and not self._is_pytorch_model and self._prev_force_mu is not None:
+        if self._force_guidance_enabled and not self._is_pytorch_model and self._prev_force_prediction is not None:
             force = inputs.get("force")
             if force is not None:
                 force = jnp.asarray(force)
-                prev_mu = jnp.asarray(self._prev_force_mu)
-                prev_log_sigma = jnp.asarray(self._prev_force_log_sigma)
-                if prev_mu.ndim == 3:
+                prev_prediction = jnp.asarray(self._prev_force_prediction)
+                if prev_prediction.ndim == 3:
                     force_history = inputs.get("force_history_local")
                     if force_history is not None:
-                        window = min(self._force_residual_window, prev_mu.shape[1], force_history.shape[1])
+                        window = min(
+                            self._force_residual_window,
+                            prev_prediction.shape[1],
+                            force_history.shape[1],
+                        )
                         observed_force = force_history[:, -window:, :]
-                        pred_mu = prev_mu[:, :window, :]
-                        pred_log_sigma = prev_log_sigma[:, :window, :]
+                        predicted_force = prev_prediction[:, :window, :]
                     else:
                         observed_force = force[:, None, :]
-                        pred_mu = prev_mu[:, :1, :]
-                        pred_log_sigma = prev_log_sigma[:, :1, :]
+                        predicted_force = prev_prediction[:, :1, :]
                 else:
                     observed_force = force[:, None, :]
-                    pred_mu = prev_mu[:, None, :]
-                    pred_log_sigma = prev_log_sigma[:, None, :]
+                    predicted_force = prev_prediction[:, None, :]
 
-                residual = observed_force - pred_mu
-                inv_var = jnp.exp(-2.0 * pred_log_sigma)
-                per_step_error = jnp.sum(jnp.square(residual) * inv_var, axis=-1)
+                per_step_error = _mean_squared_force_residual(observed_force, predicted_force)
                 sample_kwargs["force_prediction_error"] = jnp.mean(per_step_error, axis=-1)
 
         if noise is not None:
@@ -206,9 +203,11 @@ class Policy(BasePolicy):
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
         if self._force_guidance_enabled and self._predict_force is not None:
-            force_mu, force_log_sigma = self._predict_force(observation, outputs["actions"])
-            self._prev_force_mu = force_mu
-            self._prev_force_log_sigma = force_log_sigma
+            force_prediction = self._predict_force(observation, outputs["actions"])
+            # Accept old distributional force heads during checkpoint migration.
+            if isinstance(force_prediction, tuple):
+                force_prediction = force_prediction[0]
+            self._prev_force_prediction = force_prediction
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)

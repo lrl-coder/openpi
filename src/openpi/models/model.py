@@ -70,7 +70,7 @@ IMAGE_RESOLUTION = (224, 224)
 #     "token_loss_mask": bool[*b, l],  # Optional, loss mask for FAST model
 #     "force": float32[*b, 6],  # Optional, current force/torque observation
 #     "force_history_global": float32[*b, fgh, 6],  # Optional, long force/torque history for VLM target
-#     "force_history_local": float32[*b, flh, 6],  # Optional, short force/torque history for action conditioning
+#     "force_history_local": float32[*b, flh, 6],  # Optional legacy short force/torque history
 #     "force_history": float32[*b, fh, 6],  # Optional, legacy causal force/torque history
 #     "force_targets": float32[*b, ah, 6],  # Optional, next-step force labels
 #     "force_task_target": float32[*b, 6],  # Optional, legacy task-level force mean label
@@ -116,7 +116,8 @@ class Observation(Generic[ArrayT]):
     force: at.Float[ArrayT, "*b f"] | None = None
     force_history_global: at.Float[ArrayT, "*b fgh f"] | None = None
     force_history_local: at.Float[ArrayT, "*b flh f"] | None = None
-    # Legacy alias used by earlier force-guided checkpoints and tools. New code prefers global/local histories.
+    # Legacy aliases used by earlier force-guided checkpoints and monitoring tools.
+    # The action expert itself consumes only the instantaneous `force`.
     force_history: at.Float[ArrayT, "*b fh f"] | None = None
     force_targets: at.Float[ArrayT, "*b ah f"] | None = None
     # Legacy single-point task-level target. Force target head training prefers `force_targets` when present.

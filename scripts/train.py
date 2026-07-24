@@ -36,20 +36,16 @@ _CONSOLE_LOG_KEYS = (
     "param_norm",
     "diagnostic_loss",
     "loss_fm",
-    "force_nll",
-    "loss_force_nll",
-    "force_target_nll",
-    "loss_force_target_nll",
+    "force_l2",
+    "loss_force_l2",
     "loss_force_physical_anchor",
     "loss_force_distill",
     "loss_force_semantic_align",
     "force_distill_cosine_mean",
     "force_semantic_cosine_mean",
     "test/loss_fm",
-    "test/force_nll",
-    "test/loss_force_nll",
-    "test/force_target_nll",
-    "test/loss_force_target_nll",
+    "test/force_l2",
+    "test/loss_force_l2",
     "test/loss_force_physical_anchor",
     "test/loss_force_distill",
     "test/loss_force_semantic_align",
@@ -136,10 +132,9 @@ def _log_force_prediction_trace(
     max_samples: int = 4,
 ) -> None:
     target = np.asarray(trace["target"])
-    mu = np.asarray(trace["mu"])
-    log_sigma = np.asarray(trace["log_sigma"])
-    sigma = np.asarray(trace["sigma"])
-    var = np.asarray(trace["var"])
+    prediction = np.asarray(trace["prediction"])
+    residual = np.asarray(trace["residual"])
+    squared_error = np.asarray(trace["squared_error"])
     query_feature = np.asarray(trace["query_feature"])
     force_feature = np.asarray(trace["force_feature"])
 
@@ -150,10 +145,9 @@ def _log_force_prediction_trace(
     np.savez_compressed(
         out_path,
         target=target[:sample_count],
-        mu=mu[:sample_count],
-        log_sigma=log_sigma[:sample_count],
-        sigma=sigma[:sample_count],
-        var=var[:sample_count],
+        prediction=prediction[:sample_count],
+        residual=residual[:sample_count],
+        squared_error=squared_error[:sample_count],
         query_feature=query_feature[:sample_count],
         force_feature=force_feature[:sample_count],
     )
@@ -170,14 +164,13 @@ def _log_force_prediction_trace(
                         time_idx,
                         axis_idx,
                         float(target[sample_idx, time_idx, axis_idx]),
-                        float(mu[sample_idx, time_idx, axis_idx]),
-                        float(log_sigma[sample_idx, time_idx, axis_idx]),
-                        float(sigma[sample_idx, time_idx, axis_idx]),
-                        float(var[sample_idx, time_idx, axis_idx]),
+                        float(prediction[sample_idx, time_idx, axis_idx]),
+                        float(residual[sample_idx, time_idx, axis_idx]),
+                        float(squared_error[sample_idx, time_idx, axis_idx]),
                     ]
                 )
 
-    columns = ["sample", "time", "axis", "target", "mu", "log_sigma", "sigma", "var"]
+    columns = ["sample", "time", "axis", "target", "prediction", "residual", "squared_error"]
     csv_path = out_dir / f"step_{step:08d}.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)

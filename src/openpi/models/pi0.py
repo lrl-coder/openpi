@@ -1,5 +1,4 @@
 import logging
-import math
 
 import einops
 import flax.nnx as nnx
@@ -15,8 +14,6 @@ import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
-
-_LOG_2PI = math.log(2.0 * math.pi)
 
 
 class _ForceSemanticTemporalBlock(nnx.Module):
@@ -223,13 +220,7 @@ class Pi0(_model.BaseModel):
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
         if self.force_guidance:
-            # Deprecated compatibility layer: older force-guided checkpoints contain this
-            # parameter. The active F_phi below decodes directly from action-expert hidden states.
-            force_predictor_input_dim = (
-                config.action_dim + config.action_dim + config.force_dim + paligemma_config.width
-            )
-            self.force_predictor_in = nnx.Linear(force_predictor_input_dim, action_expert_config.width, rngs=rngs)
-            self.force_predictor_out = nnx.Linear(action_expert_config.width, 2 * config.force_dim, rngs=rngs)
+            self.force_predictor_out = nnx.Linear(action_expert_config.width, config.force_dim, rngs=rngs)
 
             self.force_semantic_query = nnx.Param(
                 0.02 * jax.random.normal(rngs.params(), (1, paligemma_config.width), dtype=jnp.float32)
@@ -255,24 +246,10 @@ class Pi0(_model.BaseModel):
             self.force_physical_summary_out = nnx.Linear(
                 config.force_semantic_feature_dim, 5 * config.force_dim, rngs=rngs
             )
-            self.force_local_conv1 = nnx.Conv(
-                config.force_dim, 64, kernel_size=3, padding="CAUSAL", rngs=rngs
-            )
-            self.force_local_norm1 = nnx.LayerNorm(64, rngs=rngs)
-            self.force_local_conv2 = nnx.Conv(
-                64, 128, kernel_size=3, padding="CAUSAL", kernel_dilation=2, rngs=rngs
-            )
-            self.force_local_norm2 = nnx.LayerNorm(128, rngs=rngs)
-            self.force_local_conv3 = nnx.Conv(
-                128,
-                action_expert_config.width,
-                kernel_size=3,
-                padding="CAUSAL",
-                kernel_dilation=4,
-                rngs=rngs,
-            )
-            self.force_local_norm3 = nnx.LayerNorm(action_expert_config.width, rngs=rngs)
-            self.force_local_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            # The action expert is conditioned only on the instantaneous force at the
+            # current control step. Global force history remains exclusive to the
+            # training-time semantic force teacher above.
+            self.force_current_proj = nnx.Linear(config.force_dim, action_expert_config.width, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -281,19 +258,12 @@ class Pi0(_model.BaseModel):
         x = x.astype(jnp.float32)
         return x * jax.lax.rsqrt(jnp.sum(jnp.square(x), axis=-1, keepdims=True) + eps)
 
-    def _force_history_or_current(self, obs: _model.Observation, dtype, *, scope: str):
+    def _global_force_history_or_current(self, obs: _model.Observation, dtype):
         batch_size = obs.state.shape[0]
-        if scope == "global":
-            target_len = self.force_history_global_len
-            preferred_history = obs.force_history_global
-        elif scope == "local":
-            target_len = self.force_history_local_len
-            preferred_history = obs.force_history_local
-        else:
-            raise ValueError(f"Unknown force history scope: {scope}")
+        target_len = self.force_history_global_len
 
-        if preferred_history is not None:
-            force_history = preferred_history.astype(dtype)
+        if obs.force_history_global is not None:
+            force_history = obs.force_history_global.astype(dtype)
         elif obs.force_history is not None:
             force_history = obs.force_history.astype(dtype)
         elif obs.force is not None:
@@ -314,7 +284,7 @@ class Pi0(_model.BaseModel):
         return jnp.broadcast_to(query[None, :, :], (batch_size, query.shape[0], query.shape[1]))
 
     def _force_semantic_raw_feature(self, obs: _model.Observation, dtype):
-        force_history = self._force_history_or_current(obs, dtype, scope="global")
+        force_history = self._global_force_history_or_current(obs, dtype)
         hidden = self.force_semantic_tcn(force_history)
         pooled = jnp.mean(hidden, axis=1)
         return self.force_semantic_out(pooled)
@@ -357,36 +327,23 @@ class Pi0(_model.BaseModel):
         loss = 1.0 - cosine
         return loss, cosine, query_feature
 
-    def _embed_force_local_token(self, obs: _model.Observation, dtype, force_attention_modulation=None):
-        force_history = self._force_history_or_current(obs, dtype, scope="local")
-        hidden = self.force_local_conv1(force_history)
-        hidden = self.force_local_norm1(hidden)
-        hidden = nnx.swish(hidden)
-        hidden = self.force_local_conv2(hidden)
-        hidden = self.force_local_norm2(hidden)
-        hidden = nnx.swish(hidden)
-        hidden = self.force_local_conv3(hidden)
-        hidden = self.force_local_norm3(hidden)
-        hidden = nnx.swish(hidden)
-        pooled = jnp.mean(hidden, axis=1)
-        pooled = self.force_local_out(pooled)
-        pooled = nnx.swish(pooled)
+    def _embed_current_force_token(self, obs: _model.Observation, dtype, force_attention_modulation=None):
+        current_force = self._current_real_force(obs, dtype)
+        if current_force is None:
+            current_force = jnp.zeros((obs.state.shape[0], self.force_dim), dtype=dtype)
+        force_token = self.force_current_proj(current_force)
         if force_attention_modulation is not None:
-            modulation = jnp.asarray(force_attention_modulation, dtype=pooled.dtype)
+            modulation = jnp.asarray(force_attention_modulation, dtype=force_token.dtype)
             if modulation.ndim == 0:
-                modulation = jnp.broadcast_to(modulation, (pooled.shape[0],))
-            pooled = pooled * (1.0 + modulation[:, None])
-        return pooled[:, None, :]
-
-    def _split_force_distribution(self, x):
-        mu, log_sigma = jnp.split(x.astype(jnp.float32), 2, axis=-1)
-        return mu, jnp.clip(log_sigma, -5.0, 3.0)
+                modulation = jnp.broadcast_to(modulation, (force_token.shape[0],))
+            force_token = force_token * (1.0 + modulation[:, None])
+        return force_token[:, None, :]
 
     def _decode_force_from_action_features(self, action_features, action_hat_0=None):
         if action_hat_0 is not None:
             action_hat_tokens = self.action_in_proj(action_hat_0.astype(action_features.dtype))
             action_features = action_features + action_hat_tokens
-        return self._split_force_distribution(self.force_predictor_out(action_features))
+        return self.force_predictor_out(action_features).astype(jnp.float32)
 
     def _action_features_from_prefix_cache(
         self,
@@ -434,11 +391,8 @@ class Pi0(_model.BaseModel):
         action_features = self._action_features_from_prefix_cache(obs, actions, timestep, prefix_mask, kv_cache)
         return self._decode_force_from_action_features(action_features, actions)
 
-    def _diag_gaussian_nll(self, target, mu, log_sigma):
-        log_sigma = jnp.clip(log_sigma, -5.0, 3.0)
-        inv_var = jnp.exp(-2.0 * log_sigma)
-        nll = 0.5 * (jnp.square(target.astype(jnp.float32) - mu) * inv_var + 2.0 * log_sigma + _LOG_2PI)
-        return jnp.mean(nll, axis=-1)
+    def _force_l2_loss(self, target, prediction):
+        return jnp.mean(jnp.square(target.astype(jnp.float32) - prediction.astype(jnp.float32)), axis=-1)
 
     def _current_real_force(self, obs: _model.Observation, dtype):
         if obs.force is not None:
@@ -451,65 +405,57 @@ class Pi0(_model.BaseModel):
             return obs.force_history_global[:, -1, :].astype(dtype)
         return None
 
-    def _force_distribution_info(self, prefix, target, mu, log_sigma, nll):
+    def _force_prediction_info(self, prefix, target, prediction, l2_loss):
         target = jax.lax.stop_gradient(target.astype(jnp.float32))
-        mu = jax.lax.stop_gradient(mu)
-        log_sigma = jax.lax.stop_gradient(log_sigma)
-        nll = jax.lax.stop_gradient(nll)
-        residual = target - mu
-        pred_sigma = jnp.exp(log_sigma)
-        pred_var = jnp.square(pred_sigma)
+        prediction = jax.lax.stop_gradient(prediction.astype(jnp.float32))
+        l2_loss = jax.lax.stop_gradient(l2_loss)
+        residual = target - prediction
         reduce_axes = tuple(range(target.ndim - 1))
 
-        pred_sigma_axis = jnp.mean(pred_sigma, axis=reduce_axes)
-        pred_var_axis = jnp.mean(pred_var, axis=reduce_axes)
+        pred_var_axis = jnp.var(prediction, axis=reduce_axes)
         true_var_axis = jnp.var(target, axis=reduce_axes)
         residual_mse_axis = jnp.mean(jnp.square(residual), axis=reduce_axes)
         var_gap_axis = pred_var_axis - true_var_axis
-        true_std_axis = jnp.sqrt(true_var_axis + 1e-8)
         residual_rmse_axis = jnp.sqrt(residual_mse_axis + 1e-8)
+        residual_mae_axis = jnp.mean(jnp.abs(residual), axis=reduce_axes)
 
         info = {
-            f"{prefix}_nll": jnp.mean(nll),
-            f"{prefix}_nll_negative_frac": jnp.mean((nll < 0.0).astype(jnp.float32)),
-            f"{prefix}_pred_log_sigma_mean": jnp.mean(log_sigma),
-            f"{prefix}_pred_log_sigma_min": jnp.min(log_sigma),
-            f"{prefix}_pred_log_sigma_max": jnp.max(log_sigma),
-            f"{prefix}_pred_log_sigma_min_clip_frac": jnp.mean((log_sigma <= -4.99).astype(jnp.float32)),
-            f"{prefix}_pred_log_sigma_max_clip_frac": jnp.mean((log_sigma >= 2.99).astype(jnp.float32)),
-            f"{prefix}_pred_sigma_mean": jnp.mean(pred_sigma),
-            f"{prefix}_pred_sigma_min": jnp.min(pred_sigma),
-            f"{prefix}_pred_sigma_max": jnp.max(pred_sigma),
-            f"{prefix}_pred_var_mean": jnp.mean(pred_var),
+            f"{prefix}_l2": jnp.mean(l2_loss),
+            f"{prefix}_prediction_mean": jnp.mean(prediction),
+            f"{prefix}_target_mean": jnp.mean(target),
+            f"{prefix}_prediction_batch_var_mean": jnp.mean(pred_var_axis),
             f"{prefix}_true_var_mean": jnp.mean(true_var_axis),
-            f"{prefix}_pred_var_minus_true_var_mean": jnp.mean(var_gap_axis),
-            f"{prefix}_pred_var_abs_gap_mean": jnp.mean(jnp.abs(var_gap_axis)),
+            f"{prefix}_prediction_var_minus_true_var_mean": jnp.mean(var_gap_axis),
+            f"{prefix}_prediction_var_abs_gap_mean": jnp.mean(jnp.abs(var_gap_axis)),
             f"{prefix}_residual_mse_mean": jnp.mean(residual_mse_axis),
-            f"{prefix}_pred_sigma_to_true_std_ratio_mean": jnp.mean(pred_sigma_axis / (true_std_axis + 1e-6)),
-            f"{prefix}_pred_var_to_residual_mse_ratio_mean": jnp.mean(pred_var_axis / (residual_mse_axis + 1e-6)),
-            f"{prefix}_residual_rmse_to_pred_sigma_ratio_mean": jnp.mean(residual_rmse_axis / (pred_sigma_axis + 1e-6)),
+            f"{prefix}_residual_rmse_mean": jnp.mean(residual_rmse_axis),
+            f"{prefix}_residual_mae_mean": jnp.mean(residual_mae_axis),
         }
         for axis in range(self.force_dim):
-            info[f"{prefix}_pred_var_axis_{axis}"] = pred_var_axis[axis]
+            info[f"{prefix}_prediction_batch_var_axis_{axis}"] = pred_var_axis[axis]
             info[f"{prefix}_true_var_axis_{axis}"] = true_var_axis[axis]
-            info[f"{prefix}_pred_var_minus_true_var_axis_{axis}"] = var_gap_axis[axis]
+            info[f"{prefix}_prediction_var_minus_true_var_axis_{axis}"] = var_gap_axis[axis]
             info[f"{prefix}_residual_mse_axis_{axis}"] = residual_mse_axis[axis]
+            info[f"{prefix}_residual_rmse_axis_{axis}"] = residual_rmse_axis[axis]
+            info[f"{prefix}_residual_mae_axis_{axis}"] = residual_mae_axis[axis]
         if target.ndim == 3:
             within_horizon_var_axis = jnp.mean(jnp.var(target, axis=1), axis=0)
             within_horizon_gap_axis = pred_var_axis - within_horizon_var_axis
             info[f"{prefix}_true_var_within_horizon_mean"] = jnp.mean(within_horizon_var_axis)
-            info[f"{prefix}_pred_var_minus_true_var_within_horizon_mean"] = jnp.mean(within_horizon_gap_axis)
-            info[f"{prefix}_pred_var_abs_gap_within_horizon_mean"] = jnp.mean(jnp.abs(within_horizon_gap_axis))
+            info[f"{prefix}_prediction_var_minus_true_var_within_horizon_mean"] = jnp.mean(within_horizon_gap_axis)
+            info[f"{prefix}_prediction_var_abs_gap_within_horizon_mean"] = jnp.mean(jnp.abs(within_horizon_gap_axis))
             for axis in range(self.force_dim):
                 info[f"{prefix}_true_var_within_horizon_axis_{axis}"] = within_horizon_var_axis[axis]
-                info[f"{prefix}_pred_var_minus_true_var_within_horizon_axis_{axis}"] = within_horizon_gap_axis[axis]
+                info[f"{prefix}_prediction_var_minus_true_var_within_horizon_axis_{axis}"] = within_horizon_gap_axis[
+                    axis
+                ]
         return info
 
     def predict_force(
         self,
         observation: _model.Observation,
         actions: _model.Actions,
-    ) -> tuple[at.Float[at.Array, "b ah f"], at.Float[at.Array, "b ah f"]]:
+    ) -> at.Float[at.Array, "b ah f"]:
         if not self.force_guidance:
             raise ValueError("predict_force is only available when force_guidance=True.")
 
@@ -544,16 +490,15 @@ class Pi0(_model.BaseModel):
             prefix_mask,
             kv_cache,
         )
-        force_mu, force_log_sigma = self._decode_force_from_action_features(clean_action_features, actions)
-        force_log_sigma = jnp.clip(force_log_sigma, -5.0, 3.0)
+        force_prediction = self._decode_force_from_action_features(clean_action_features, actions)
         query_feature = self._semantic_force_query_feature(prefix_out)
         force_feature = self._encode_force_semantic_feature(observation, prefix_out.dtype)
+        residual = observation.force_targets.astype(jnp.float32) - force_prediction
         return {
             "target": observation.force_targets.astype(jnp.float32),
-            "mu": force_mu.astype(jnp.float32),
-            "log_sigma": force_log_sigma,
-            "sigma": jnp.exp(force_log_sigma),
-            "var": jnp.exp(2.0 * force_log_sigma),
+            "prediction": force_prediction,
+            "residual": residual,
+            "squared_error": jnp.square(residual),
             "query_feature": query_feature.astype(jnp.float32),
             "force_feature": force_feature.astype(jnp.float32),
         }
@@ -616,10 +561,10 @@ class Pi0(_model.BaseModel):
         ar_mask = []
         tokens = []
         if self.force_guidance:
-            force_token = self._embed_force_local_token(obs, noisy_actions.dtype, force_attention_modulation)
+            force_token = self._embed_current_force_token(obs, noisy_actions.dtype, force_attention_modulation)
             tokens.append(force_token)
             input_mask.append(jnp.ones(force_token.shape[:2], dtype=jnp.bool_))
-            # Local force history is a causal condition for state/action suffix tokens.
+            # The instantaneous force is a causal condition for state/action suffix tokens.
             ar_mask += [True]
 
         if not self.pi05:
@@ -709,18 +654,17 @@ class Pi0(_model.BaseModel):
 
         if self.force_loss_weight > 0.0 and observation.force_targets is not None:
             action_hat_0 = jax.lax.stop_gradient(x_t - time_expanded * v_t)
-            force_mu, force_log_sigma = self._decode_force_from_action_features(action_features, action_hat_0)
-            force_loss = self._diag_gaussian_nll(observation.force_targets, force_mu, force_log_sigma)
+            force_prediction = self._decode_force_from_action_features(action_features, action_hat_0)
+            force_loss = self._force_l2_loss(observation.force_targets, force_prediction)
             loss = loss + self.force_loss_weight * force_loss
             if return_info:
-                info["loss_force_nll"] = jnp.mean(force_loss)
+                info["loss_force_l2"] = jnp.mean(force_loss)
                 info["loss_force_weighted"] = self.force_loss_weight * jnp.mean(force_loss)
                 info.update(
-                    self._force_distribution_info(
+                    self._force_prediction_info(
                         "force",
                         observation.force_targets,
-                        force_mu,
-                        force_log_sigma,
+                        force_prediction,
                         force_loss,
                     )
                 )
@@ -741,9 +685,7 @@ class Pi0(_model.BaseModel):
             if return_info:
                 assert physical_info is not None
                 info["loss_force_physical_anchor"] = jnp.mean(physical_loss)
-                info["loss_force_physical_anchor_weighted"] = (
-                    self.force_physical_loss_weight * jnp.mean(physical_loss)
-                )
+                info["loss_force_physical_anchor_weighted"] = self.force_physical_loss_weight * jnp.mean(physical_loss)
                 info.update(physical_info)
 
         if self.force_target_loss_weight > 0.0:
@@ -756,9 +698,7 @@ class Pi0(_model.BaseModel):
                 info["force_distill_cosine_mean"] = jnp.mean(distill_cosine)
                 # Compatibility names for existing monitoring dashboards and CSV readers.
                 info["loss_force_semantic_align"] = jnp.mean(distill_loss)
-                info["loss_force_semantic_align_weighted"] = (
-                    self.force_target_loss_weight * jnp.mean(distill_loss)
-                )
+                info["loss_force_semantic_align_weighted"] = self.force_target_loss_weight * jnp.mean(distill_loss)
                 info["force_semantic_cosine_mean"] = jnp.mean(distill_cosine)
 
         return loss, info
@@ -777,6 +717,7 @@ class Pi0(_model.BaseModel):
         force_attention_modulation: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
         # Backward-compatible alias for the earlier force-token gate name.
         force_token_gate: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
+        # Deprecated no-op distributional-guidance arguments retained for caller compatibility.
         force_target_mu: at.Float[at.Array, "b f"] | at.Float[at.Array, "b ah f"] | None = None,
         force_target_log_sigma: at.Float[at.Array, "b f"] | at.Float[at.Array, "b ah f"] | None = None,
     ) -> _model.Actions:
@@ -792,9 +733,7 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (_, _), kv_cache = self.PaliGemma.llm(
-            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
-        )
+        (_, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         force_error = force_prediction_error if force_prediction_error is not None else cst_tau
         if self.force_guidance:

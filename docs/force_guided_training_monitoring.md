@@ -1,5 +1,9 @@
 # Force-guided pi0 训练监视文档
 
+> 分支差异：`action-expert-current-force-L2-loss` 不再记录 NLL、`log_sigma` 或
+> 预测分布校准指标，新的 L2/残差指标见
+> [action_expert_current_force_l2.md](action_expert_current_force_l2.md)。
+
 本文档用于监视 `pi0_flexiv_pump_1bottle_inputForce_lora_force_guided` / TCN force semantic encoder 训练是否异常。
 
 ## 1. 启动阶段检查

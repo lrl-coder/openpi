@@ -39,7 +39,8 @@ class Pi0Config(_model.BaseModelConfig):
     force_dim: int = 6
     # Global force history is a longer contact context for the VLM-level semantic target.
     force_history_global_len: int = 64
-    # Local force history is a shorter contact context for immediate action conditioning.
+    # Legacy local-history shape retained for data/checkpoint compatibility. The action
+    # expert consumes only `force`, projected by one linear layer.
     force_history_local_len: int = 16
     force_global_patch_size: int = 8
     force_semantic_feature_dim: int = 256
@@ -102,9 +103,7 @@ class Pi0Config(_model.BaseModelConfig):
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
                 force=(
-                    jax.ShapeDtypeStruct([batch_size, self.force_dim], jnp.float32)
-                    if self.force_guidance
-                    else None
+                    jax.ShapeDtypeStruct([batch_size, self.force_dim], jnp.float32) if self.force_guidance else None
                 ),
                 force_history_global=(
                     jax.ShapeDtypeStruct([batch_size, self.force_history_global_len, self.force_dim], jnp.float32)
@@ -123,9 +122,7 @@ class Pi0Config(_model.BaseModelConfig):
                     else None
                 ),
                 force_task_target=(
-                    jax.ShapeDtypeStruct([batch_size, self.force_dim], jnp.float32)
-                    if self.force_guidance
-                    else None
+                    jax.ShapeDtypeStruct([batch_size, self.force_dim], jnp.float32) if self.force_guidance else None
                 ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
