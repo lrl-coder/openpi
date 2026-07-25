@@ -45,16 +45,10 @@ class Pi0Config(_model.BaseModelConfig):
     force_global_patch_size: int = 8
     force_semantic_feature_dim: int = 256
     force_loss_weight: float = 0.0
-    # Weight for asymmetric contact-dynamics distillation. The name is kept for CLI/checkpoint config compatibility.
+    # Weight for contact-dynamics distillation.
     force_target_loss_weight: float = 0.0
     # Weight for the force encoder's physical summary prediction anchor.
     force_physical_loss_weight: float = 0.0
-    force_guidance_lambda_max: float = 0.0
-    # Preferred FRAM name. If set, overrides the legacy force_guidance_lambda_max.
-    force_attention_modulation_max: float | None = None
-    # Legacy fields kept for checkpoint/config compatibility. FRAM uses the normalized residual score directly.
-    force_guidance_k: float = 1.0
-    force_guidance_tau0: float = 6.0
 
     def __post_init__(self):
         if self.max_token_len is None:

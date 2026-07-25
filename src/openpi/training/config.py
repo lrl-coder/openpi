@@ -129,6 +129,14 @@ def _force_norm_stats_from_state(
         return norm_stats
 
     state_stats = norm_stats["state"]
+    state_dim = np.asarray(state_stats.mean).shape[-1]
+    if state_dim < 13:
+        raise ValueError(
+            "Force-guided Flexiv configs require normalization stats computed from the raw 13D state "
+            f"(got state stats with {state_dim} dims). Run `uv run scripts/compute_norm_stats.py "
+            "--config-name pi0_flexiv_pump_1bottle_inputForce_lora_with_force` for LoRA, or the matching "
+            "`*_with_force` full-finetune config, then point the force-guided config at those assets."
+        )
     force_stats = _normalize.NormStats(
         mean=np.asarray(state_stats.mean)[7:13],
         std=np.asarray(state_stats.std)[7:13],
@@ -925,11 +933,10 @@ _CONFIGS = [
             force_loss_weight=0.05,
             force_target_loss_weight=0.01,
             force_physical_loss_weight=0.05,
-            force_guidance_lambda_max=0.2,
         ),
         data=_flexiv_pump_data_config(
             force_guided=True,
-            assets_dir="./assets/pi0_flexiv_pump_1bottle_inputForce_lora",
+            assets_dir="./assets/pi0_flexiv_pump_1bottle_inputForce_lora_with_force",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
@@ -953,7 +960,6 @@ _CONFIGS = [
             force_loss_weight=0.05,
             force_target_loss_weight=0.01,
             force_physical_loss_weight=0.05,
-            force_guidance_lambda_max=0.2,
         ),
         data=_flexiv_pump_data_config(
             include_force=True,
@@ -1002,11 +1008,10 @@ _CONFIGS = [
             force_loss_weight=0.05,
             force_target_loss_weight=0.01,
             force_physical_loss_weight=0.05,
-            force_guidance_lambda_max=0.2,
         ),
         data=_flexiv_pump_data_config(
             force_guided=True,
-            assets_dir="./assets/pi0_flexiv_pump_1bottle_inputForce",
+            assets_dir="./assets/pi0_flexiv_pump_1bottle_inputForce_with_force",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
@@ -1022,7 +1027,6 @@ _CONFIGS = [
             force_loss_weight=0.05,
             force_target_loss_weight=0.01,
             force_physical_loss_weight=0.05,
-            force_guidance_lambda_max=0.2,
         ),
         data=_flexiv_pump_data_config(
             include_force=True,

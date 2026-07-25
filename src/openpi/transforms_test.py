@@ -62,6 +62,27 @@ def test_absolute_actions_noop():
     assert transform(item) is item
 
 
+def test_unnormalize_optional_force_prediction():
+    stats = _transforms.NormStats(
+        mean=np.array([10.0, 20.0]),
+        std=np.array([2.0, 4.0]),
+    )
+    transform = _transforms.Unnormalize({"force_prediction": stats}, strict=False)
+
+    without_prediction = {"actions": np.zeros((2, 2))}
+    assert transform(without_prediction) == without_prediction
+
+    with_prediction = {
+        "actions": np.zeros((2, 2)),
+        "force_prediction": np.array([[0.0, 1.0], [-1.0, 0.5]]),
+    }
+    transformed = transform(with_prediction)
+    np.testing.assert_allclose(
+        transformed["force_prediction"],
+        np.array([[10.0, 24.000001], [7.999999, 22.0000005]]),
+    )
+
+
 def test_make_bool_mask():
     assert _transforms.make_bool_mask(2, -2, 2) == (True, True, False, False, True, True)
     assert _transforms.make_bool_mask(2, 0, 2) == (True, True, True, True)

@@ -4,7 +4,7 @@
 
 - 分支：`action-expert-current-force-L2-loss`
 - 记录日期：2026-07-24
-- 影响范围：JAX `Pi0` 的 force-guided action expert、辅助力预测头 `F_phi`、训练诊断与在线残差门控
+- 影响范围：JAX `Pi0` 的 force-aware action expert、辅助力预测头 `F_phi`、训练诊断与 CoRACE 在线执行
 - 不影响范围：未启用 `force_guidance` 的原始 π0、flow-matching 主损失、VLM semantic-force query、全局历史力 teacher
 
 ## 目标
@@ -130,27 +130,33 @@ force_history_global [B, 64, 6]
     -> semantic-force query distillation
 ```
 
-因此，`force_history_global` 仍是训练 semantic-force teacher 所必需的输入。数据管线继续产生 `force_history_local` / `force_history`，仅用于旧工具、可选残差窗口和检查点迁移，不再参与 action token 的构造。
+因此，`force_history_global` 仍是训练 semantic-force teacher 所必需的输入。数据管线继续产生
+`force_history_local` / `force_history`，仅用于数据兼容和诊断，不再参与 action token 或在线残差的构造。
 
-## 在线闭环残差
+## 在线执行：CoRACE
 
-旧实现用预测分布方差对白化残差：
-
-```text
-error = sum((f_observed - mu_pred)^2 * exp(-2 * log_sigma_pred))
-```
-
-新实现没有 `log_sigma`，因此改为与训练目标一致的普通均方残差：
+旧 token 缩放路径已删除。残差不再缩放 force token，也不进入 denoising。推理期由
+**CoRACE（Contact-Residual Adaptive Chunk Execution）**把 `F_phi` 的预测作为 action chunk 的执行监测信号：
 
 ```text
-error = mean((f_observed - force_prediction)^2, axis=force_dim)
+policy(o_t) -> action_chunk[0:H], force_prediction[0:H]
+execute action[k]
+observe force[k]
+compare force[k] with force_prediction[k]
+if calibrated residual is exceeded:
+    discard action[k+1:H]
+    replan from the latest observation
 ```
 
-默认 `force_residual_window=1`，比较当前真实力与上一轮预测的第一个未来力。所得 error 继续进入现有 FRAM 映射：
+在线残差使用独立尺度消除 6 个轴的单位与量级差异：
 
 ```text
-modulation = modulation_max * error / (error + force_dim)
+r_k = mean_j(((force_observed[k, j] - force_prediction[k, j]) / force_scale[j]) ** 2)
 ```
+
+`force_scale` 从训练划分的预测残差估计；阈值从独立 nominal calibration rollouts
+用 chunk 最大残差的 split-conformal 分位数得到。完整协议、公式和部署方式见
+[`contact_residual_adaptive_chunk_execution.md`](contact_residual_adaptive_chunk_execution.md)。
 
 ## 代码位置
 
@@ -161,8 +167,12 @@ modulation = modulation_max * error / (error + force_dim)
   - `_force_l2_loss`：L2/MSE 辅助损失
   - `_force_prediction_info`：L2 诊断指标
 - `src/openpi/policies/policy.py`
-  - 缓存单值力预测
-  - 使用未做方差加权的 MSE 残差
+  - 可选返回与 action chunk 对齐的 `force_prediction`
+  - 不再缓存上一轮残差或改变下一轮网络前向
+- `packages/openpi-client/src/openpi_client/action_chunk_broker.py`
+  - `CoRACEActionChunkBroker`：逐步对齐预测力与实测力
+  - 超阈值时丢弃未执行 suffix 并从最新观测重规划
+  - 提供残差尺度估计与 split-conformal 阈值标定函数
 - `scripts/train.py`
   - 保存 `prediction`、`residual`、`squared_error` trace
 - `scripts/analyze_force_metrics.py`
@@ -195,7 +205,7 @@ force = observation.state[7:13]
 - 新增 `force_current_proj`；
 - `force_predictor_out` 的输出维度从 `2 * force_dim` 改为 `force_dim`。
 
-因此不要从旧 NLL force-guided checkpoint 直接 `resume`。应从 π0 base 权重启动一个新的实验目录，让新力层随机初始化后训练。在线 policy 对旧式 `(mu, log_sigma)` 返回值保留了读取兼容，但这不等于新模型结构可以无损加载旧力头参数。
+因此不要从旧 NLL force-guided checkpoint 直接 `resume`。应从 π0 base 权重启动一个新的实验目录，让新力层随机初始化后训练。旧式 `(mu, log_sigma)` 推理输出和残差 token modulation 参数已不再兼容。
 
 ## 建议训练命令
 
@@ -217,26 +227,32 @@ uv run scripts/train.py \
 3. `force_predictor_out.out_features == force_dim`；
 4. 日志包含 `loss_force_l2`，不再产生 `loss_force_nll` 或 `log_sigma` 指标；
 5. `predict_force` 输出形状为 `[B, action_horizon, force_dim]`；
-6. baseline π0 单测与 force-guided 新增单测全部通过。
+6. `return_force_prediction=True` 返回物理单位的 `[action_horizon, force_dim]` 预测；
+7. CoRACE 只比较已执行动作的同索引预测，超阈值时立即重规划；
+8. baseline π0、force-aware 模型与 CoRACE 单测全部通过。
 
 ## 2026-07-24 验证结果
 
 静态检查：
 
 ```text
-ruff check（忽略仓库 array-typing 字符串触发的既有 F821）: passed
+ruff check（全部变更 Python 文件）: passed
 git diff --check: passed
-Python py_compile: passed
 ```
 
 自动测试：
 
 ```text
 pytest -m "not manual" \
+  packages/openpi-client/src/openpi_client/action_chunk_broker_test.py \
   src/openpi/models/pi0_test.py \
-  src/openpi/policies/policy_test.py
+  src/openpi/policies/policy_test.py \
+  src/openpi/transforms_test.py
 
-8 passed, 2 deselected
+27 passed, 2 deselected
+
+pytest packages/openpi-client/src/openpi_client
+28 passed
 ```
 
 实际 JAX 前向：
@@ -244,19 +260,18 @@ pytest -m "not manual" \
 ```text
 force-guided dummy model:
   compute_loss_info -> loss.shape = (1, 4)
+  sample_actions     -> actions.shape = (1, 4, 8)
   predict_force     -> prediction.shape = (1, 4, 6)
   loss_force_l2     -> finite
-  NLL metrics       -> absent
-
-baseline dummy model, force_guidance=False:
-  compute_loss  -> loss.shape = (1, 4)
-  sample_actions -> actions.shape = (1, 4, 8)
   all outputs finite
 ```
 
-训练诊断工具：
+CoRACE：
 
 ```text
-L2 metrics analysis report: passed
-prediction/residual/squared_error NPZ + CSV trace export: passed
+strict action/force index alignment: passed
+sensor-delay alignment: passed
+residual trigger and suffix discard: passed
+split-conformal threshold calibration: passed
+physical-unit force output transform: passed
 ```

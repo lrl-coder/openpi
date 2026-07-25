@@ -95,7 +95,7 @@ force-guided 配置现在包含：
 
 ```text
 L = L_flow
-  + force_loss_weight * L_force_NLL
+  + force_loss_weight * L_force_L2
   + force_physical_loss_weight * L_phys
   + force_target_loss_weight * L_distill
 ```
@@ -216,7 +216,7 @@ force_physical_summary_mse 下降
 loss_force_distill 下降
 force_batch_std_mean 不再持续接近 0
 query_batch_std_mean 不再持续接近 0
-force_prediction target vs mu 更接近
+force prediction 与 target 更接近
 主任务 loss_fm 不明显变坏
 ```
 

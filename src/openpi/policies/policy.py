@@ -35,11 +35,6 @@ def _pad_or_trim_force_history(history: np.ndarray, current_force: np.ndarray, t
     return history
 
 
-def _mean_squared_force_residual(observed_force, predicted_force):
-    """Returns one unweighted L2 residual score per batch/time entry."""
-    return jnp.mean(jnp.square(observed_force - predicted_force), axis=-1)
-
-
 class Policy(BasePolicy):
     def __init__(
         self,
@@ -73,22 +68,8 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
-        force_attention_modulation_from_residual = self._sample_kwargs.pop(
-            "force_attention_modulation_from_residual", None
-        )
-        force_guidance_from_residual = self._sample_kwargs.pop("force_guidance_from_residual", None)
-        force_guidance_from_cst = self._sample_kwargs.pop("force_guidance_from_cst", False)
-        if force_attention_modulation_from_residual is None:
-            force_attention_modulation_from_residual = force_guidance_from_residual
-        self._force_guidance_enabled = bool(
-            force_guidance_from_cst
-            if force_attention_modulation_from_residual is None
-            else force_attention_modulation_from_residual
-        )
-        force_residual_window = self._sample_kwargs.pop("force_residual_window", 1)
-        self._force_residual_window = max(1, int(force_residual_window))
+        self._return_force_prediction = bool(self._sample_kwargs.pop("return_force_prediction", False))
         self._force_model_enabled = bool(getattr(model, "force_guidance", False))
-        self._prev_force_prediction = None
         self._force_history_global = None
         self._force_history_local = None
         model_config = getattr(model, "config", None)
@@ -98,6 +79,8 @@ class Policy(BasePolicy):
             self._force_history_global_len = int(model.force_history_global_len)
         if hasattr(model, "force_history_local_len"):
             self._force_history_local_len = int(model.force_history_local_len)
+        if self._return_force_prediction and (self._is_pytorch_model or not self._force_model_enabled):
+            raise ValueError("return_force_prediction=True requires a JAX force-aware model with force_guidance=True.")
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -109,7 +92,7 @@ class Policy(BasePolicy):
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._predict_force = (
                 nnx_utils.module_jit(model.predict_force)
-                if self._force_guidance_enabled and hasattr(model, "predict_force")
+                if self._return_force_prediction and hasattr(model, "predict_force")
                 else None
             )
             self._rng = rng or jax.random.key(0)
@@ -117,7 +100,6 @@ class Policy(BasePolicy):
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         if bool(np.asarray(obs.get("reset", False))):
-            self._prev_force_prediction = None
             self._force_history_global = None
             self._force_history_local = None
 
@@ -162,33 +144,7 @@ class Policy(BasePolicy):
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
 
-        # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
-        if self._force_guidance_enabled and not self._is_pytorch_model and self._prev_force_prediction is not None:
-            force = inputs.get("force")
-            if force is not None:
-                force = jnp.asarray(force)
-                prev_prediction = jnp.asarray(self._prev_force_prediction)
-                if prev_prediction.ndim == 3:
-                    force_history = inputs.get("force_history_local")
-                    if force_history is not None:
-                        window = min(
-                            self._force_residual_window,
-                            prev_prediction.shape[1],
-                            force_history.shape[1],
-                        )
-                        observed_force = force_history[:, -window:, :]
-                        predicted_force = prev_prediction[:, :window, :]
-                    else:
-                        observed_force = force[:, None, :]
-                        predicted_force = prev_prediction[:, :1, :]
-                else:
-                    observed_force = force[:, None, :]
-                    predicted_force = prev_prediction[:, None, :]
-
-                per_step_error = _mean_squared_force_residual(observed_force, predicted_force)
-                sample_kwargs["force_prediction_error"] = jnp.mean(per_step_error, axis=-1)
-
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
@@ -202,12 +158,9 @@ class Policy(BasePolicy):
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
-        if self._force_guidance_enabled and self._predict_force is not None:
+        if self._return_force_prediction and self._predict_force is not None:
             force_prediction = self._predict_force(observation, outputs["actions"])
-            # Accept old distributional force heads during checkpoint migration.
-            if isinstance(force_prediction, tuple):
-                force_prediction = force_prediction[0]
-            self._prev_force_prediction = force_prediction
+            outputs["force_prediction"] = force_prediction
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)

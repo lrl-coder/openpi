@@ -182,11 +182,6 @@ class Pi0(_model.BaseModel):
         self.force_loss_weight = config.force_loss_weight
         self.force_target_loss_weight = config.force_target_loss_weight
         self.force_physical_loss_weight = config.force_physical_loss_weight
-        self.force_attention_modulation_max = (
-            config.force_attention_modulation_max
-            if config.force_attention_modulation_max is not None
-            else config.force_guidance_lambda_max
-        )
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -327,16 +322,11 @@ class Pi0(_model.BaseModel):
         loss = 1.0 - cosine
         return loss, cosine, query_feature
 
-    def _embed_current_force_token(self, obs: _model.Observation, dtype, force_attention_modulation=None):
+    def _embed_current_force_token(self, obs: _model.Observation, dtype):
         current_force = self._current_real_force(obs, dtype)
         if current_force is None:
             current_force = jnp.zeros((obs.state.shape[0], self.force_dim), dtype=dtype)
         force_token = self.force_current_proj(current_force)
-        if force_attention_modulation is not None:
-            modulation = jnp.asarray(force_attention_modulation, dtype=force_token.dtype)
-            if modulation.ndim == 0:
-                modulation = jnp.broadcast_to(modulation, (force_token.shape[0],))
-            force_token = force_token * (1.0 + modulation[:, None])
         return force_token[:, None, :]
 
     def _decode_force_from_action_features(self, action_features, action_hat_0=None):
@@ -352,12 +342,9 @@ class Pi0(_model.BaseModel):
         timestep: at.Float[at.Array, " b"],
         prefix_mask,
         kv_cache,
-        force_attention_modulation: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
     ):
         batch_size = actions.shape[0]
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-            obs, actions, timestep, force_attention_modulation
-        )
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(obs, actions, timestep)
         suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
         prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
         full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
@@ -550,7 +537,6 @@ class Pi0(_model.BaseModel):
         obs: _model.Observation,
         noisy_actions: _model.Actions,
         timestep: at.Float[at.Array, " b"],
-        force_attention_modulation: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -561,7 +547,7 @@ class Pi0(_model.BaseModel):
         ar_mask = []
         tokens = []
         if self.force_guidance:
-            force_token = self._embed_current_force_token(obs, noisy_actions.dtype, force_attention_modulation)
+            force_token = self._embed_current_force_token(obs, noisy_actions.dtype)
             tokens.append(force_token)
             input_mask.append(jnp.ones(force_token.shape[:2], dtype=jnp.bool_))
             # The instantaneous force is a causal condition for state/action suffix tokens.
@@ -711,15 +697,6 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
-        force_prediction_error: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
-        cst_tau: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
-        force_guidance_lambda: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
-        force_attention_modulation: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
-        # Backward-compatible alias for the earlier force-token gate name.
-        force_token_gate: at.Float[at.Array, "b"] | at.Float[at.Array, ""] | None = None,
-        # Deprecated no-op distributional-guidance arguments retained for caller compatibility.
-        force_target_mu: at.Float[at.Array, "b f"] | at.Float[at.Array, "b ah f"] | None = None,
-        force_target_log_sigma: at.Float[at.Array, "b f"] | at.Float[at.Array, "b ah f"] | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -735,28 +712,10 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         (_, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        force_error = force_prediction_error if force_prediction_error is not None else cst_tau
-        if self.force_guidance:
-            if force_attention_modulation is None and force_token_gate is not None:
-                force_attention_modulation = force_token_gate
-            if force_attention_modulation is None and force_guidance_lambda is not None:
-                force_attention_modulation = force_guidance_lambda
-            elif force_attention_modulation is None and force_error is not None:
-                force_error = jnp.asarray(force_error, dtype=jnp.float32)
-                if force_error.ndim == 0:
-                    force_error = jnp.broadcast_to(force_error, (batch_size,))
-                force_attention_modulation = self.force_attention_modulation_max * (
-                    force_error / (force_error + float(self.force_dim))
-                )
-            if force_attention_modulation is not None:
-                force_attention_modulation = jnp.asarray(force_attention_modulation, dtype=jnp.float32)
-                if force_attention_modulation.ndim == 0:
-                    force_attention_modulation = jnp.broadcast_to(force_attention_modulation, (batch_size,))
-
         def step(carry):
             x_t, time = carry
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size), force_attention_modulation
+                observation, x_t, jnp.broadcast_to(time, batch_size)
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other

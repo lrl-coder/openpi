@@ -1,21 +1,60 @@
+from types import SimpleNamespace
+
+import flax.nnx as nnx
 import jax.numpy as jnp
 import numpy as np
 from openpi_client import action_chunk_broker
 import pytest
 
+from openpi import transforms
 from openpi.policies import aloha_policy
+from openpi.policies import libero_policy
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.training import config as _config
 
 
-def test_mean_squared_force_residual():
-    observed = jnp.array([[[1.0, 2.0], [4.0, 6.0]]])
-    predicted = jnp.array([[[0.0, 0.0], [2.0, 2.0]]])
+class _ForcePredictionModel(nnx.Module):
+    force_guidance = True
 
-    residual = _policy._mean_squared_force_residual(observed, predicted)  # noqa: SLF001
+    def __init__(self):
+        self.config = SimpleNamespace(force_history_global_len=4, force_history_local_len=2)
 
-    np.testing.assert_allclose(residual, np.array([[2.5, 10.0]]))
+    def sample_actions(self, rng, observation, **kwargs):
+        del rng, kwargs
+        return jnp.ones((observation.state.shape[0], 3, 7), dtype=jnp.float32)
+
+    def predict_force(self, observation, actions):
+        del observation
+        return jnp.zeros((actions.shape[0], actions.shape[1], 6), dtype=jnp.float32)
+
+
+def test_policy_returns_unnormalized_force_prediction_for_corace():
+    force_stats = transforms.NormStats(
+        mean=np.arange(6, dtype=np.float32),
+        std=np.full(6, 2.0, dtype=np.float32),
+    )
+    policy = _policy.Policy(
+        _ForcePredictionModel(),
+        sample_kwargs={"return_force_prediction": True},
+        output_transforms=[
+            transforms.Unnormalize({"force_prediction": force_stats}, strict=False),
+            libero_policy.LiberoOutputs(),
+        ],
+    )
+
+    result = policy.infer(
+        {
+            "image": {},
+            "image_mask": {},
+            "state": np.zeros(7, dtype=np.float32),
+            "force": np.zeros(6, dtype=np.float32),
+        }
+    )
+
+    assert result["actions"].shape == (3, 7)
+    assert result["force_prediction"].shape == (3, 6)
+    np.testing.assert_allclose(result["force_prediction"], np.broadcast_to(np.arange(6), (3, 6)))
 
 
 @pytest.mark.manual

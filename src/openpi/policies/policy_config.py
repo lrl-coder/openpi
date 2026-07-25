@@ -73,8 +73,14 @@ def create_trained_policy(
             pytorch_device = "cpu"
 
     output_norm_stats = None
+    force_output_norm_stats = None
     if norm_stats is not None:
         output_norm_stats = {key: value for key, value in norm_stats.items() if key in {"state", "actions"}}
+        force_stats = norm_stats.get("force", norm_stats.get("force_targets"))
+        if force_stats is not None:
+            force_output_norm_stats = {"force_prediction": force_stats}
+    if bool((sample_kwargs or {}).get("return_force_prediction")) and force_output_norm_stats is None:
+        raise ValueError("return_force_prediction=True requires force normalization statistics in the checkpoint.")
 
     return _policy.Policy(
         model,
@@ -88,6 +94,11 @@ def create_trained_policy(
         output_transforms=[
             *data_config.model_transforms.outputs,
             transforms.Unnormalize(output_norm_stats, use_quantiles=data_config.use_quantile_norm),
+            transforms.Unnormalize(
+                force_output_norm_stats,
+                use_quantiles=data_config.use_quantile_norm,
+                strict=False,
+            ),
             *data_config.data_transforms.outputs,
             *repack_transforms.outputs,
         ],

@@ -117,3 +117,31 @@ def test_force_predictor_uses_l2_and_outputs_one_force_vector_per_action():
 
     assert prediction.shape == (2, 4, 6)
     np.testing.assert_allclose(l2_loss, np.array([[5.0, 10.0]], dtype=np.float32))
+
+
+def test_force_aware_model_samples_actions_and_predicts_aligned_force():
+    key = jax.random.key(0)
+    config = _pi0_config.Pi0Config(
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        action_dim=8,
+        action_horizon=4,
+        max_token_len=8,
+        force_guidance=True,
+        force_loss_weight=0.05,
+    )
+    model = config.create(key)
+    observation = config.fake_obs(batch_size=1)
+    target_actions = config.fake_act(batch_size=1)
+
+    loss, info = model.compute_loss_info(key, observation, target_actions)
+    actions = model.sample_actions(key, observation, num_steps=2)
+    force_prediction = model.predict_force(observation, actions)
+
+    assert loss.shape == (1, config.action_horizon)
+    assert actions.shape == (1, config.action_horizon, config.action_dim)
+    assert force_prediction.shape == (1, config.action_horizon, config.force_dim)
+    assert "loss_force_l2" in info
+    assert np.all(np.isfinite(loss))
+    assert np.all(np.isfinite(actions))
+    assert np.all(np.isfinite(force_prediction))

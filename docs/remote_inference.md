@@ -69,3 +69,8 @@ for step in range(num_steps):
 ```
 
 Here, the `host` and `port` arguments specify the IP address and port of the remote policy server. You can also specify these as command-line arguments to your robot code, or hard-code them in your robot codebase. The `observation` is a dictionary of observations and the prompt, following the specification of the policy inputs for the policy you are serving. We have concrete examples of how to construct this dictionary for different environments in the [simple client example](../examples/simple_client/main.py).
+
+For force-aware checkpoints, the optional
+[CoRACE execution broker](contact_residual_adaptive_chunk_execution.md) can monitor the
+action-aligned force prediction on every control step and request a fresh chunk only when
+the calibrated contact residual is violated.

@@ -1,191 +1,6 @@
-# flexiv_pump_1bottle_inputForce 微调 pi0_base
+# Flexiv Pump：π0 微调与 CoRACE 部署
 
-> 分支差异：`action-expert-current-force-L2-loss` 已将 action expert 的局部历史力
-> TCN 替换为当前瞬时力 Linear，并将 `F_phi` 的 Gaussian NLL 替换为 L2。
-> 本文中的旧 NLL/`log_sigma` 章节仅作历史参考；当前实现以
-> [action_expert_current_force_l2.md](action_expert_current_force_l2.md) 为准。
-
-本文档记录当前机器上使用 openpi 微调 `pi0_base` 的运行方式。数据集已经是 LeRobot dataset 格式：
-
-```text
-/root/autodl-tmp/data/force_vla_data/data_lerobot/flexiv_pump_1bottle_inputForce
-```
-
-当前已在 `src/openpi/training/config.py` 中加入 baseline 和 force-guided 训练配置：
-
-```text
-pi0_flexiv_pump_1bottle_inputForce_lora
-pi0_flexiv_pump_1bottle_inputForce_lora_with_force
-pi0_flexiv_pump_1bottle_inputForce_lora_force_guided
-pi0_flexiv_pump_1bottle_inputForce_lora_with_force_guided
-pi0_flexiv_pump_1bottle_inputForce
-pi0_flexiv_pump_1bottle_inputForce_with_force
-pi0_flexiv_pump_1bottle_inputForce_force_guided
-pi0_flexiv_pump_1bottle_inputForce_with_force_guided
-```
-
-推荐优先使用 `pi0_flexiv_pump_1bottle_inputForce_lora`。openpi README 中给出的显存参考是：LoRA 微调约需要 22.5GB 以上显存，全量微调约需要 70GB 以上显存。
-如果要训练新增 CFRG/力预测/语义力目标方案，优先使用 `pi0_flexiv_pump_1bottle_inputForce_lora_force_guided`。
-
-## 训练/测试集划分
-
-当前本地数据集共 50 个 episode，已经在下面这个文件中按 8:2 划分：
-
-```text
-/root/autodl-tmp/data/force_vla_data/data_lerobot/flexiv_pump_1bottle_inputForce/meta/info.json
-```
-
-```json
-"splits": {
-    "train": "0:40",
-    "test": "40:50"
-}
-```
-
-Flexiv pump 相关训练配置默认只使用 `train` split。训练时还会每隔 `log_interval` step 在 `test` split 上跑 `eval_num_batches` 个 batch，并把指标写到 wandb 和 checkpoint 目录的 `metrics.csv`。默认 `eval_num_batches=1`，可以在训练命令后加 `--eval-num-batches=4` 等参数提高测试指标稳定性。
-
-## 训练配置在哪里看
-
-主要看这个文件：
-
-```text
-/root/autodl-tmp/openpi/src/openpi/training/config.py
-```
-
-当前 flexiv pump 相关配置在 `_CONFIGS` 列表里：
-
-```text
-pi0_flexiv_pump_1bottle_inputForce_lora            # LoRA, 默认只用 state 前 7 维
-pi0_flexiv_pump_1bottle_inputForce_lora_with_force # LoRA, 使用完整 13 维 state
-pi0_flexiv_pump_1bottle_inputForce_lora_force_guided            # LoRA, 前 7 维 state + 单独 force 辅助头
-pi0_flexiv_pump_1bottle_inputForce_lora_with_force_guided # LoRA, 完整 13 维 state + 单独 force 辅助头
-pi0_flexiv_pump_1bottle_inputForce                 # 全量微调, 默认只用 state 前 7 维
-pi0_flexiv_pump_1bottle_inputForce_with_force      # 全量微调, 使用完整 13 维 state
-pi0_flexiv_pump_1bottle_inputForce_force_guided                 # 全量微调, 前 7 维 state + 单独 force 辅助头
-pi0_flexiv_pump_1bottle_inputForce_with_force_guided      # 全量微调, 完整 13 维 state + 单独 force 辅助头
-```
-
-这些配置当前显式设置了：
-
-```text
-num_train_steps = 20_000
-batch_size      = 16
-num_workers     = 0
-weight_loader   = gs://openpi-assets/checkpoints/pi0_base/params
-```
-
-force-guided 配置额外设置：
-
-```text
-model.force_guidance             = True
-model.force_loss_weight          = 0.05
-model.force_target_loss_weight   = 0.01  # 当前作为 semantic-force query 对齐 loss 权重
-model.force_guidance_lambda_max  = 0.2
-```
-
-LoRA 配置额外设置：
-
-```text
-model         = Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora")
-freeze_filter = LoRA 默认 freeze filter
-ema_decay     = None
-```
-
-全量微调配置使用：
-
-```text
-model     = Pi0Config()
-ema_decay = 0.99  # 继承 TrainConfig 默认值
-```
-
-没有在 flexiv pump 配置里显式写的参数，会继承 `TrainConfig` 默认值。常用默认值如下：
-
-```text
-project_name        = openpi
-assets_base_dir     = ./assets
-checkpoint_base_dir = /root/autodl-fs/openpi_checkpoints
-seed                = 42
-log_interval        = 100
-save_interval       = 1000
-keep_period         = 5000
-wandb_enabled       = True
-eval_split          = test
-eval_num_batches    = 1
-fsdp_devices        = 1
-```
-
-也就是说，默认每 100 step 打印/记录一次训练和测试日志，每 1000 step 保存一次 checkpoint，且每 5000 step 的 checkpoint 会被保留。终端只打印核心摘要，完整 scalar 指标会写入 checkpoint 目录下的 `metrics.csv`，同时继续写入 wandb。测试集 loss 会以 `test/loss` 记录；force-guided 配置还会记录 `test/loss_fm`、`test/loss_force_nll`、`test/loss_force_semantic_align` 等诊断项。
-
-如果想临时覆盖配置，不一定要改代码，可以在训练命令后加参数。例如只训练 5000 step、关闭 wandb：
-
-```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-uv run scripts/train.py pi0_flexiv_pump_1bottle_inputForce_lora \
-  --exp-name=flexiv_pump_lora_5k \
-  --num-train-steps=5000 \
-  --no-wandb-enabled \
-  --overwrite
-```
-
-也可以用 `--help` 查看某个 config 当前所有可覆盖参数：
-
-```bash
-uv run python scripts/train.py pi0_flexiv_pump_1bottle_inputForce_lora --help
-```
-
-## 数据映射
-
-配置里使用的字段映射如下：
-
-```text
-observation.image       -> base_0_rgb
-observation.wrist_image -> left_wrist_0_rgb
-observation.state       -> state
-action                  -> actions
-tasks.jsonl             -> prompt
-```
-
-`observation.state` 原始是 13 维：
-
-```text
-current_eef_pose(6), gripper_width(1), f_ext_base_frame(6)
-```
-
-默认训练只使用前 7 维作为 state：
-
-```text
-current_eef_pose(6), gripper_width(1)
-```
-
-最后 6 维 `f_ext_base_frame` 先不参与训练。需要加入力信息时，使用 `*_with_force` 配置：
-
-```text
-pi0_flexiv_pump_1bottle_inputForce_lora_with_force
-pi0_flexiv_pump_1bottle_inputForce_with_force
-```
-
-force-guided 配置会始终从原始 13 维 `observation.state` 里拆出最后 6 维作为单独的 force 信号：
-
-```text
-force              = observation.state[7:13]
-force_history_global = 全局 force 历史窗口, shape = (64, 6)
-force_history_local  = 局部 force 历史窗口, shape = (16, 6)
-force_history        = 兼容字段，等同于 force_history_local
-force_targets      = 下一时刻 force 序列, shape = (50, 6)
-force_task_target  = 当前 action chunk 内 force_targets 的均值, shape = (6,), 仅作为兼容字段
-```
-
-`*_force_guided` 默认仍只把前 7 维送进 pi0 的常规 `state` token；力通过全局/局部两条路径进入 VLM prefix 和动作头 suffix，并通过 `F_phi`、semantic target head、CFRG 引导影响训练和推理。`*_with_force_guided` 则同时把完整 13 维送进常规 `state` token，用于做对照实验。
-
-注意：所有 `*_force_guided` 配置在训练和推理时都要求输入原始 13 维 `observation/state`，因为当前力 `force = state[7:13]` 会被用于构造 `force_history_global`、`force_history_local`、CFRG 和 `F_phi`。区别只在于常规 pi0 state token 使用前 7 维还是完整 13 维。
-
-pi0 需要 32 维 state/action，所以 openpi 会把 7 维或 13 维 state 自动 pad 到 32 维。`action` 原始是 7 维：
-
-```text
-target_eef_pose(6), target_gripper_width(1)
-```
-
-训练时前 6 维 EEF pose 会转为 delta action，最后 1 维 gripper width 保持绝对值。推理输出会自动转回 7 维动作。
+本文只描述当前实现。旧 Gaussian-NLL、采样能量引导和残差 token modulation 路径已经删除。
 
 ## 环境变量
 
@@ -200,35 +15,9 @@ export HF_DATASETS_CACHE=/root/autodl-fs/openpi_cache/hf_datasets
 export HF_HOME=/root/autodl-fs/openpi_cache/hf_home
 ```
 
-不建议把 `HF_DATASETS_CACHE` 放在 `/root/autodl-tmp`。LeRobot 会把 parquet 生成 Arrow cache，当前数据集生成过程已经在小盘上触发过 `No space left on device`。如果确认空间足够，才临时改回：
-
-```bash
-cd /root/autodl-tmp/openpi
-
-export OMP_NUM_THREADS=1
-export HF_LEROBOT_HOME=/root/autodl-tmp/data/force_vla_data/data_lerobot
-export HF_DATASETS_CACHE=/root/autodl-tmp/openpi/.cache/huggingface/datasets
-export HF_HOME=/root/autodl-tmp/openpi/.cache/huggingface
-```
-
-注意：当前这个本地 openpi 仓库里，预训练权重下载缓存实际默认解析到：
-
-```text
-/root/autodl-fs/openpi
-```
-
-也就是 `pi0_base` 会从 `gs://openpi-assets/checkpoints/pi0_base/params` 下载/缓存到这个大盘目录；不需要额外放到项目 `.cache/openpi` 里。
-
 ## 归一化统计
 
-训练前必须先有 norm stats。目前四个配置的 norm stats 都已经准备好，可以直接训练：
-
-```text
-/root/autodl-tmp/openpi/assets/pi0_flexiv_pump_1bottle_inputForce_lora/flexiv_pump_1bottle_inputForce/norm_stats.json
-/root/autodl-tmp/openpi/assets/pi0_flexiv_pump_1bottle_inputForce_lora_with_force/flexiv_pump_1bottle_inputForce/norm_stats.json
-/root/autodl-tmp/openpi/assets/pi0_flexiv_pump_1bottle_inputForce/flexiv_pump_1bottle_inputForce/norm_stats.json
-/root/autodl-tmp/openpi/assets/pi0_flexiv_pump_1bottle_inputForce_with_force/flexiv_pump_1bottle_inputForce/norm_stats.json
-```
+训练前必须先有 norm stats。
 
 这些 stats 来自完整 13 维 state。默认 7 维配置归一化时只会取前 7 维统计量。如果想重新生成更干净的 7 维统计，或者文件不存在，运行：
 
@@ -258,460 +47,141 @@ uv run scripts/compute_norm_stats.py \
   --config-name pi0_flexiv_pump_1bottle_inputForce_with_force
 ```
 
-## LoRA 微调
+## 配置选择
 
-推荐命令：
-
-```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-uv run scripts/train.py pi0_flexiv_pump_1bottle_inputForce_lora \
-  --exp-name=flexiv_pump_lora \
-  --overwrite
-```
-
-如果训练中断后想继续同一个实验：
-
-```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-uv run scripts/train.py pi0_flexiv_pump_1bottle_inputForce_lora \
-  --exp-name=flexiv_pump_lora \
-  --resume
-```
-
-checkpoint 默认保存到：
+推荐主实验：
 
 ```text
-/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora/flexiv_pump_lora
+pi0_flexiv_pump_1bottle_inputForce_lora_force_guided
 ```
 
-这个目录由两部分决定：
+对照配置：
 
 ```text
-checkpoint_base_dir = /root/autodl-fs/openpi_checkpoints
-config name         = pi0_flexiv_pump_1bottle_inputForce_lora
---exp-name          = flexiv_pump_lora
+pi0_flexiv_pump_1bottle_inputForce_lora
+pi0_flexiv_pump_1bottle_inputForce_lora_with_force
+pi0_flexiv_pump_1bottle_inputForce_lora_with_force_guided
+pi0_flexiv_pump_1bottle_inputForce
+pi0_flexiv_pump_1bottle_inputForce_with_force
+pi0_flexiv_pump_1bottle_inputForce_force_guided
+pi0_flexiv_pump_1bottle_inputForce_with_force_guided
 ```
 
-公式是：
+命名含义：
 
-```text
-{checkpoint_base_dir}/{config_name}/{exp_name}
-```
+- `lora`：只训练 LoRA 与新增模块；
+- `with_force`：常规 state token 也接收完整 13D state；
+- `force_guided`：历史力语义 teacher、当前力 action token 和 `F_phi` 力预测头；名称为配置兼容保留，
+  当前在线执行模块称为 CoRACE。
 
-在当前机器上，`/root/autodl-fs` 是指向 AutoDL 文件存储的路径；Python 解析后的绝对路径可能显示为 `/autodl-fs/data/...`，两者指向同一个文件存储。
+## 数据格式
 
-如果命令里把 `--exp-name` 改成 `test_run`，保存目录就会变成：
-
-```text
-/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora/test_run
-```
-
-## 全量微调
-
-只有显存足够时再用全量微调：
-
-```bash
-uv run scripts/compute_norm_stats.py \
-  --config-name pi0_flexiv_pump_1bottle_inputForce
-
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-uv run scripts/train.py pi0_flexiv_pump_1bottle_inputForce \
-  --exp-name=flexiv_pump_full \
-  --overwrite
-```
-
-checkpoint 默认保存到：
-
-```text
-/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce/flexiv_pump_full
-```
-
-## 带力信息训练
-
-如果要把 `f_ext_base_frame(6)` 也加入 state，使用 `*_with_force` 配置。LoRA 命令：
-
-```bash
-uv run scripts/compute_norm_stats.py \
-  --config-name pi0_flexiv_pump_1bottle_inputForce_lora_with_force
-
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-uv run scripts/train.py pi0_flexiv_pump_1bottle_inputForce_lora_with_force \
-  --exp-name=flexiv_pump_lora_with_force \
-  --overwrite
-```
-
-推理时传入的 `observation/state` 也必须是 13 维：
+原始观测 state：
 
 ```text
 current_eef_pose(6), gripper_width(1), f_ext_base_frame(6)
 ```
 
-带力 LoRA 的 checkpoint 默认保存到：
-
-```text
-/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora_with_force/flexiv_pump_lora_with_force
-```
-
-## Force-guided 训练
-
-模型主图 HTML 在：
-
-```text
-/root/autodl-tmp/openpi/docs/force_guided_pi0_main_figure.html
-```
-
-可以直接用浏览器打开并截图，用于论文草图或汇报。
-
-新增方案对应四个配置：
-
-```text
-pi0_flexiv_pump_1bottle_inputForce_lora_force_guided
-pi0_flexiv_pump_1bottle_inputForce_lora_with_force_guided
-pi0_flexiv_pump_1bottle_inputForce_force_guided
-pi0_flexiv_pump_1bottle_inputForce_with_force_guided
-```
-
-推荐先跑 LoRA 版本：
-
-```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-uv run scripts/train.py pi0_flexiv_pump_1bottle_inputForce_lora_force_guided \
-  --exp-name=flexiv_pump_lora_force_guided \
-  --overwrite
-```
-
-该配置复用已有 baseline norm stats，并自动从 `state[7:13]` 派生 `force`、`force_history_global`、`force_history_local`、`force_targets`、`force_task_target` 的归一化统计，不需要单独复制一份 norm stats。
-
-当前实现包含：
-
-```text
-force_history_global: 64 x 6, 对应当前帧及过去 63 帧，用于全局接触上下文
-force_history_local: 16 x 6, 对应当前帧及过去 15 帧，用于局部接触动态
-VLM semantic path: learnable semantic-force query token -> 与 image/language prefix 双向交互
-Force teacher path: force_history_global -> causal dilated Conv1D -> actual force feature
-Action local path: force_history_local -> causal dilated Conv1D -> force condition token -> action suffix
-Action auxiliary force predictor F_phi: action-head hidden features -> (mu_f, log_sigma_f)
-Training loss: L = L_FM + 0.05 * L_F_phi + 0.01 * L_semantic_align
-Policy CFRG: r_t = sum((f_t - mu_{f,t-1,0})^2 / sigma_{f,t-1,0}^2)
-Guided sampling: lambda(r_t) = 0.2 * r_t / (r_t + 6), force reference 只约束 F_phi 的第一个未来力 step
-```
-
-训练监督里，`F_phi` 不再是独立拼接 MLP；它挂在原动作头的 action-token hidden features 后面，只做数值解码。标签仍使用 action chunk 中每个示范动作对应的下一帧 force。
-语义力目标不再把历史力作为 VLM prefix token，也不再训练未来力预测头。当前做法是在 VLM prefix 前插入一个 learnable semantic-force query token；该 token 只和图像、语言交互，输出 query feature。真实历史力 `force_history_global(64, 6)` 只进入训练期 force teacher encoder，得到 actual force feature。两者用 cosine alignment 对齐：
-
-```text
-L_semantic_align = 1 - cosine(z_query, z_force)
-```
-
-推理时 semantic-force query 仍保留在 VLM prefix 中，但不需要 `force_history_global` 参与 VLM。CFRG 默认用当前真实力与上一轮一步预测之间的同时间步残差来门控引导，并将当前传感器力作为 observed force anchor 传入 `force_target_mu/log_sigma`；不再平移上一轮未来力预测轨迹，也不再做一阶力外推。`force_target_mu/log_sigma` 仍可通过 `sample_actions` 显式覆盖。
-
-### Force NLL / 方差诊断
-
-force-guided 训练会额外在日志 step 跑一次无梯度诊断前向，并把力预测分布指标写到 checkpoint 目录下的 `metrics.csv` 和 wandb。终端 tqdm 只显示核心摘要，训练反向仍只走原来的 `train_step`，诊断不进入梯度图。
-
-连续高斯 NLL 可以是负数，这本身不是数值错误。因为 NLL 里有 `log(sigma)` 项，当力标签已经归一化、预测残差很小、模型预测的 `sigma < 1` 时，`L_F_phi` 可以小于 0。需要判断的是方差是否坍塌。语义力目标当前不是 NLL，而是 semantic-force query feature 和真实历史力 feature 的 cosine alignment。
-
-重点看这些指标：
-
-```text
-loss                 # 总训练 loss
-diagnostic_loss      # 同一 batch 的诊断总 loss
-loss_fm              # flow matching loss
-loss_force_nll       # F_phi 原始 NLL，未乘 0.05
-loss_force_weighted  # 0.05 * loss_force_nll
-loss_force_semantic_align
-loss_force_semantic_align_weighted
-force_semantic_cosine_mean
-
-force_pred_log_sigma_mean/min/max
-force_pred_log_sigma_min_clip_frac
-force_pred_sigma_mean/min/max
-force_pred_var_mean
-force_true_var_mean
-force_pred_var_minus_true_var_mean
-force_pred_var_abs_gap_mean
-force_residual_mse_mean
-force_pred_sigma_to_true_std_ratio_mean
-force_pred_var_to_residual_mse_ratio_mean
-force_residual_rmse_to_pred_sigma_ratio_mean
-force_nll_negative_frac
-```
-
-每个力轴也会输出：
-
-```text
-force_pred_var_axis_0..5
-force_true_var_axis_0..5
-force_pred_var_minus_true_var_axis_0..5
-force_residual_mse_axis_0..5
-```
-
-判断方式：
-
-```text
-正常收敛:
-  force_residual_mse_mean 下降
-  force_pred_sigma_mean 随残差下降而下降
-  force_pred_log_sigma_min_clip_frac 接近 0
-
-疑似方差坍塌:
-  force_pred_log_sigma_min_clip_frac 长时间接近 1
-  force_pred_sigma_mean 非常小
-  force_pred_var_minus_true_var_mean 明显为负
-  force_residual_rmse_to_pred_sigma_ratio_mean 很大
-  loss_force_nll 很负但 residual_mse 没有同步变小
-```
-
-当前 `log_sigma` 在模型里裁剪到 `[-5, 3]`，所以最小 `sigma = exp(-5) ~= 0.0067`。如果 `force_pred_log_sigma_min_clip_frac` 很高，说明模型在持续顶到这个下界。
-
-## 输出目录速查
-
-### checkpoint
-
-LoRA 默认 7 维 state：
-
-```text
-/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora/<exp_name>
-```
-
-LoRA 带力 13 维 state：
-
-```text
-/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora_with_force/<exp_name>
-```
-
-全量默认 7 维 state：
-
-```text
-/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce/<exp_name>
-```
-
-全量带力 13 维 state：
-
-```text
-/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_with_force/<exp_name>
-```
-
-LoRA force-guided：
-
-```text
-/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora_force_guided/<exp_name>
-```
-
-每个训练 step checkpoint 目录里通常会有：
-
-```text
-params/       # 用于推理加载的模型权重
-train_state/  # 训练状态, resume 需要
-assets/       # norm stats 等资产
-```
-
-启动 policy server 时传给 `--policy.dir` 的是具体 step 目录，例如：
-
-```text
-/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora/flexiv_pump_lora/19999
-```
-
-当前 `num_train_steps=20_000` 时，训练循环的最后一个 step index 是 `19999`，所以最终 checkpoint 通常保存在 `19999`。中间 checkpoint 按 `save_interval=1000` 保存，例如 `1000`, `2000`, ..., `19000`。
-
-### norm stats
-
-norm stats 在：
-
-```text
-/root/autodl-tmp/openpi/assets/<config_name>/flexiv_pump_1bottle_inputForce/norm_stats.json
-```
-
-训练保存 checkpoint 时，会把对应 norm stats 复制到 checkpoint 的 `assets/` 里面，推理时会从 checkpoint 读取。
-
-### Hugging Face / openpi 缓存
-
-按本文档设置后，HF / datasets 缓存写到：
-
-```text
-/root/autodl-fs/openpi_cache/hf_home
-```
-
-openpi 预训练权重缓存当前实际写到：
-
-```text
-/root/autodl-fs/openpi
-```
-
-### CSV 指标日志
-
-训练脚本会把完整 scalar 指标写到当前实验 checkpoint 目录：
-
-```text
-/root/autodl-fs/openpi_checkpoints/<config_name>/<exp_name>/metrics.csv
-```
-
-例如当前 force-guided 命令对应：
-
-```text
-/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora_force_guided/flexiv_pump_lora_force_guided/metrics.csv
-```
-
-终端只会打印短摘要，例如 `loss`, `grad_norm`, `diagnostic_loss`, `loss_fm`, `loss_force_nll`, `loss_force_semantic_align`, `force_semantic_cosine_mean`。完整的 `force_pred_*` 方差诊断和 semantic-force 对齐指标都在 CSV 里，后续可以直接用 pandas 分析：
-
-```python
-import pandas as pd
-
-df = pd.read_csv("/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora_force_guided/flexiv_pump_lora_force_guided/metrics.csv")
-print(df[["step", "loss", "loss_force_nll", "loss_force_semantic_align", "force_semantic_cosine_mean"]].tail())
-```
-
-### wandb
-
-`wandb_enabled=True` 是默认值。训练脚本会使用：
-
-```text
-project = openpi
-name    = --exp-name 的值
-```
-
-如果没有配置 wandb 或不想上传，训练命令加：
-
-```bash
---no-wandb-enabled
-```
-
-## 启动策略服务
-
-训练完成后，查看可用 checkpoint step：
-
-```bash
-ls /root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora/flexiv_pump_lora
-```
-
-选择其中一个 step 目录，例如 `<step>`，启动 policy server：
-
-```bash
-uv run scripts/serve_policy.py policy:checkpoint \
-  --policy.config=pi0_flexiv_pump_1bottle_inputForce_lora \
-  --policy.dir=/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora/flexiv_pump_lora/<step>
-```
-
-force-guided checkpoint 如果要启用 CFRG 引导，启动时加 `--policy.force-guidance-from-residual`。旧的 `--policy.force-guidance-from-cst` 仍保留为历史兼容别名：
-
-```bash
-uv run scripts/serve_policy.py policy:checkpoint \
-  --policy.config=pi0_flexiv_pump_1bottle_inputForce_lora_force_guided \
-  --policy.dir=/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora_force_guided/flexiv_pump_lora_force_guided/<step> \
-  --policy.force-guidance-from-residual
-```
-
-启用后，policy 会保存上一次 `F_phi` 对未来 action horizon 的完整力预测。下一次推理收到当前 `force` 后，先用上一轮第 0 步预测计算因果力残差：
-
-$$
-r_t = \sum_i \frac{(f_{t,i} - \mu^{t-1}_{0,i})^2}{(\sigma^{t-1}_{0,i})^2}
-$$
-
-$$
-\lambda(r_t) = 0.2 \cdot \frac{r_t}{r_t + 6}
-$$
-
-随后用短历史力构造近端一步参考 `f_ref = f_t + (f_t - f_{t-1})`，并只约束本轮候选动作的第一个未来力预测。远期动作仍由原始 diffusion policy 决定。
-
-第一次推理没有上一帧力预测，因此不会引导；从第二次推理开始生效。
-
-无论是否启用 CFRG 引导，force-guided policy 都会维护两个滑动窗口：长度 64 的 `force_history_global` 和长度 16 的 `force_history_local`。第一次推理时用当前力重复填满两个窗口，之后每次推理追加当前力并丢弃最旧力。
-
-客户端传入 observation 时字段应保持为：
-
-```python
-observation = {
-    "observation/image": image,
-    "observation/wrist_image": wrist_image,
-    "observation/state": state,
-    "prompt": "Press the pump dispenser on the bottle all the way down.",
-}
-```
-
-默认 baseline 配置中 `state` 使用前 7 维。如果服务的是 `*_with_force` 或任何 `*_force_guided` checkpoint，`state` 需要传原始 13 维。
-
-返回的 `actions` 形状是：
-
-```text
-(action_horizon, 7)
-```
-
-其中 7 维动作含义是：
+原始动作：
 
 ```text
 target_eef_pose(6), target_gripper_width(1)
 ```
 
-## 快速检查
-
-检查 dataloader 是否能正常读到数据和 norm stats：
-
-```bash
-export OMP_NUM_THREADS=1
-export HF_LEROBOT_HOME=/root/autodl-tmp/data/force_vla_data/data_lerobot
-export HF_DATASETS_CACHE=/root/autodl-fs/openpi_cache/hf_datasets
-export HF_HOME=/root/autodl-fs/openpi_cache/hf_home
-
-uv run python - <<'PY'
-from openpi.training import config as _config
-from openpi.training import data_loader as _data_loader
-
-cfg = _config.get_config("pi0_flexiv_pump_1bottle_inputForce_lora")
-dl = _data_loader.create_data_loader(cfg, shuffle=False, num_batches=1, skip_norm_stats=False)
-obs, actions = next(iter(dl))
-
-print("state", obs.state.shape, obs.state.dtype)
-print("actions", actions.shape, actions.dtype)
-print("images", {k: v.shape for k, v in obs.images.items()})
-print("prompt", obs.tokenized_prompt.shape, obs.tokenized_prompt_mask.shape)
-PY
-```
-
-正常输出应类似：
+所有 `*_force_guided` 配置都要求原始 13D state。默认主配置只把前 7 维作为常规 state token，
+但单独提取：
 
 ```text
-state (16, 32) float32
-actions (16, 50, 32) float32
-images {'base_0_rgb': (16, 224, 224, 3), 'left_wrist_0_rgb': (16, 224, 224, 3), 'right_wrist_0_rgb': (16, 224, 224, 3)}
-prompt (16, 48) (16, 48)
+force                 = state[7:13]
+force_history_global  = 64-step history
+force_targets         = future force aligned to the action horizon
 ```
 
-注意这里的 `state (16, 32)` 是模型输入最终 pad 后的形状；默认配置在 pad 前只使用原始 state 的前 7 维，`*_with_force` 配置在 pad 前使用完整 13 维。
+action expert 的力条件只有当前 `force` 经一个 Linear 投影；64 步全局历史只用于训练期 contact-dynamics
+teacher。详细结构见
+[`action_expert_current_force_l2.md`](action_expert_current_force_l2.md) 和
+[`contact_dynamics_token_force_anchor.md`](contact_dynamics_token_force_anchor.md)。
 
-检查 force-guided batch：
-
-```bash
-export OMP_NUM_THREADS=1
-export HF_LEROBOT_HOME=/root/autodl-tmp/data/force_vla_data/data_lerobot
-export HF_DATASETS_CACHE=/root/autodl-fs/openpi_cache/hf_datasets
-export HF_HOME=/root/autodl-fs/openpi_cache/hf_home
-
-uv run python - <<'PY'
-from openpi.training import config as _config
-from openpi.training import data_loader as _data_loader
-
-cfg = _config.get_config("pi0_flexiv_pump_1bottle_inputForce_lora_force_guided")
-dl = _data_loader.create_data_loader(cfg, shuffle=False, num_batches=1, skip_norm_stats=False)
-obs, actions = next(iter(dl))
-
-print("state", obs.state.shape, obs.state.dtype)
-print("force", obs.force.shape, obs.force.dtype)
-print("force_history_global", obs.force_history_global.shape, obs.force_history_global.dtype)
-print("force_history_local", obs.force_history_local.shape, obs.force_history_local.dtype)
-print("force_targets", obs.force_targets.shape, obs.force_targets.dtype)
-print("force_task_target", obs.force_task_target.shape, obs.force_task_target.dtype)
-print("actions", actions.shape, actions.dtype)
-PY
-```
-
-正常输出应类似：
+## 当前训练目标
 
 ```text
-state (16, 32) float32
-force (16, 6) float32
-force_history_global (16, 64, 6) float32
-force_history_local (16, 16, 6) float32
-force_targets (16, 50, 6) float32
-force_task_target (16, 6) float32
-actions (16, 50, 32) float32
+L = L_flow
+  + 0.05 * L_force_L2
+  + 0.05 * L_physical_anchor
+  + 0.01 * L_contact_distill
 ```
+
+其中 `F_phi` 直接回归：
+
+```text
+force_prediction: [batch, action_horizon, 6]
+```
+
+不再输出 `log_sigma`，不再优化 Gaussian NLL。
+
+## 训练
+
+```bash
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+uv run scripts/train.py \
+  pi0_flexiv_pump_1bottle_inputForce_lora_force_guided \
+  --exp-name=flexiv_pump_lora_current_force_l2 \
+  --overwrite
+```
+
+旧 force-aware checkpoint 的力头结构不同，不能直接 resume。应从 π0 base 权重启动新实验目录。
+
+重点监控：
+
+```text
+loss_fm
+loss_force_l2
+loss_force_weighted
+force_residual_mse_mean
+force_residual_rmse_mean
+force_prediction_batch_var_mean
+force_true_var_mean
+loss_force_physical_anchor
+loss_force_distill
+force_distill_cosine_mean
+```
+
+若 `force_prediction_batch_var_mean` 长期接近 0，而 `force_true_var_mean` 明显非 0，说明 L2 头可能退化为
+条件均值；此时先检查 action/force 时间对齐与数据方差，再调 loss weight。
+
+## 固定 chunk 推理
+
+```bash
+uv run scripts/serve_policy.py policy:checkpoint \
+  --policy.config=pi0_flexiv_pump_1bottle_inputForce_lora_force_guided \
+  --policy.dir=/path/to/checkpoint
+```
+
+输入仍需包含原始 13D `observation/state`。
+
+## CoRACE 闭环执行
+
+服务端额外返回物理单位的未来力预测：
+
+```bash
+uv run scripts/serve_policy.py policy:checkpoint \
+  --policy.config=pi0_flexiv_pump_1bottle_inputForce_lora_force_guided \
+  --policy.dir=/path/to/checkpoint \
+  --policy.return-force-prediction
+```
+
+机器人端用 `CoRACEActionChunkBroker` 包装 websocket client。每个控制步都把最新 6D force 放在 observation
+的 `force` 键中并调用 broker；broker 只在 chunk 耗尽或残差超阈值时访问服务端。
+
+阈值必须从独立 nominal calibration rollouts 标定，不要复用训练 loss 或手写常数。完整公式、客户端代码、
+传感器延迟设置和消融设计见
+[`contact_residual_adaptive_chunk_execution.md`](contact_residual_adaptive_chunk_execution.md)。
+
+## 最小验收
+
+1. 数据中的 action 与 future force target 逐控制步对齐；
+2. `predict_force` 输出 `[B, H, 6]` 且物理单位反归一化正确；
+3. 离线按 horizon step 报告六轴 RMSE，而不只报总平均；
+4. 固定 chunk、每步重规划、CoRACE 使用相同 checkpoint；
+5. 同时报告成功率、峰值力、query 次数、平均实际 chunk 长度和误触发率；
+6. 机器人安全限位与急停独立于 CoRACE。
