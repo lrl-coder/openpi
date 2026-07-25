@@ -74,6 +74,12 @@ IMAGE_RESOLUTION = (224, 224)
 #     "force_history": float32[*b, fh, 6],  # Optional, legacy causal force/torque history
 #     "force_targets": float32[*b, ah, 6],  # Optional, next-step force labels
 #     "force_task_target": float32[*b, 6],  # Optional, legacy task-level force mean label
+#     "fra_joint_states": float32[*b, ah, nq],  # Optional current joint states for stale-chunk training
+#     "fra_force_history": float32[*b, ah, fgh, 6],  # Optional force histories ending at each chunk step
+#     "fra_nominal_action": float32[*b, ad],  # Optional nominal action for reflex-only inference
+#     "fra_previous_nominal_action": float32[*b, ad],  # Previous action in the nominal chunk
+#     "fra_current_joint_state": float32[*b, nq],  # Current arm joint state for reflex-only inference
+#     "fra_chunk_progress": float32[*b, 1],  # Current chunk index divided by the chunk length
 #
 #      # Actions data.
 #      "actions": float32[*b ah ad]
@@ -123,6 +129,17 @@ class Observation(Generic[ArrayT]):
     # Legacy single-point task-level target. Force target head training prefers `force_targets` when present.
     force_task_target: at.Float[ArrayT, "*b f"] | None = None
 
+    # Force Reflex Adapter (FRA) fields. During stage-two training, the trajectory
+    # fields provide the feedback observed at every possible stale-chunk age.
+    # During reflex-only inference, the scalar-step fields provide the nominal
+    # command that should be corrected without running the VLA again.
+    fra_joint_states: at.Float[ArrayT, "*b ah nq"] | None = None
+    fra_force_history: at.Float[ArrayT, "*b ah fgh f"] | None = None
+    fra_nominal_action: at.Float[ArrayT, "*b ad"] | None = None
+    fra_previous_nominal_action: at.Float[ArrayT, "*b ad"] | None = None
+    fra_current_joint_state: at.Float[ArrayT, "*b nq"] | None = None
+    fra_chunk_progress: at.Float[ArrayT, "*b one"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -149,6 +166,12 @@ class Observation(Generic[ArrayT]):
             force_history=data.get("force_history"),
             force_targets=data.get("force_targets"),
             force_task_target=data.get("force_task_target"),
+            fra_joint_states=data.get("fra_joint_states"),
+            fra_force_history=data.get("fra_force_history"),
+            fra_nominal_action=data.get("fra_nominal_action"),
+            fra_previous_nominal_action=data.get("fra_previous_nominal_action"),
+            fra_current_joint_state=data.get("fra_current_joint_state"),
+            fra_chunk_progress=data.get("fra_chunk_progress"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -234,6 +257,12 @@ def preprocess_observation(
         force_history=observation.force_history,
         force_targets=observation.force_targets,
         force_task_target=observation.force_task_target,
+        fra_joint_states=observation.fra_joint_states,
+        fra_force_history=observation.fra_force_history,
+        fra_nominal_action=observation.fra_nominal_action,
+        fra_previous_nominal_action=observation.fra_previous_nominal_action,
+        fra_current_joint_state=observation.fra_current_joint_state,
+        fra_chunk_progress=observation.fra_chunk_progress,
     )
 
 

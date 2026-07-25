@@ -3,19 +3,16 @@ from types import SimpleNamespace
 import flax.nnx as nnx
 import jax.numpy as jnp
 import numpy as np
-from openpi_client import action_chunk_broker
 import pytest
 
-from openpi import transforms
-from openpi.policies import aloha_policy
 from openpi.policies import libero_policy
 from openpi.policies import policy as _policy
-from openpi.policies import policy_config as _policy_config
-from openpi.training import config as _config
 
 
-class _ForcePredictionModel(nnx.Module):
+class _ForceReflexModel(nnx.Module):
     force_guidance = True
+    fra_enabled = True
+    fra_arm_dim = 2
 
     def __init__(self):
         self.config = SimpleNamespace(force_history_global_len=4, force_history_local_len=2)
@@ -24,21 +21,20 @@ class _ForcePredictionModel(nnx.Module):
         del rng, kwargs
         return jnp.ones((observation.state.shape[0], 3, 7), dtype=jnp.float32)
 
-    def predict_force(self, observation, actions):
-        del observation
-        return jnp.zeros((actions.shape[0], actions.shape[1], 6), dtype=jnp.float32)
+    def predict_reflex(self, observation):
+        corrected = observation.fra_nominal_action.at[:, :2].add(0.5)
+        return {
+            "corrected_action": corrected,
+            "residual": jnp.full((corrected.shape[0], 2), 0.5),
+            "gate": jnp.full((corrected.shape[0], 2), 0.25),
+        }
 
 
-def test_policy_returns_unnormalized_force_prediction_for_corace():
-    force_stats = transforms.NormStats(
-        mean=np.arange(6, dtype=np.float32),
-        std=np.full(6, 2.0, dtype=np.float32),
-    )
+def test_policy_runs_reflex_without_sampling_a_new_chunk(monkeypatch):
+    monkeypatch.setattr(_policy.nnx_utils, "module_jit", lambda fn: fn)
     policy = _policy.Policy(
-        _ForcePredictionModel(),
-        sample_kwargs={"return_force_prediction": True},
+        _ForceReflexModel(),
         output_transforms=[
-            transforms.Unnormalize({"force_prediction": force_stats}, strict=False),
             libero_policy.LiberoOutputs(),
         ],
     )
@@ -49,16 +45,27 @@ def test_policy_returns_unnormalized_force_prediction_for_corace():
             "image_mask": {},
             "state": np.zeros(7, dtype=np.float32),
             "force": np.zeros(6, dtype=np.float32),
+            "force_history_global": np.zeros((4, 6), dtype=np.float32),
+            "fra_mode": True,
+            "fra_nominal_action": np.arange(7, dtype=np.float32),
+            "fra_previous_nominal_action": np.arange(7, dtype=np.float32),
+            "fra_current_joint_state": np.zeros(2, dtype=np.float32),
+            "fra_chunk_progress": np.array([0.5], dtype=np.float32),
         }
     )
 
-    assert result["actions"].shape == (3, 7)
-    assert result["force_prediction"].shape == (3, 6)
-    np.testing.assert_allclose(result["force_prediction"], np.broadcast_to(np.arange(6), (3, 6)))
+    assert result["actions"].shape == (1, 7)
+    np.testing.assert_allclose(result["actions"][0, :2], [0.5, 1.5])
+    np.testing.assert_allclose(result["fra"]["residual"], [0.5, 0.5])
+    np.testing.assert_allclose(result["fra"]["gate"], [0.25, 0.25])
 
 
 @pytest.mark.manual
 def test_infer():
+    from openpi.policies import aloha_policy
+    from openpi.policies import policy_config as _policy_config
+    from openpi.training import config as _config
+
     config = _config.get_config("pi0_aloha_sim")
     policy = _policy_config.create_trained_policy(config, "gs://openpi-assets/checkpoints/pi0_aloha_sim")
 
@@ -70,6 +77,12 @@ def test_infer():
 
 @pytest.mark.manual
 def test_broker():
+    from openpi_client import action_chunk_broker
+
+    from openpi.policies import aloha_policy
+    from openpi.policies import policy_config as _policy_config
+    from openpi.training import config as _config
+
     config = _config.get_config("pi0_aloha_sim")
     policy = _policy_config.create_trained_policy(config, "gs://openpi-assets/checkpoints/pi0_aloha_sim")
 

@@ -2,6 +2,10 @@
 
 本文档记录 force-guided pi0 模块的一次关键修改：把原来的双分支 cosine semantic alignment，改成带物理锚点的 Contact Dynamics Token 训练目标。
 
+当前两阶段方案中，本模块在阶段一完成训练；阶段二将其冻结，并由
+[Force Reflex Adapter](force_reflex_adapter.md) 直接复用最新力历史对应的 Contact Dynamics Token，
+把物理接触表示转换为关节空间连续修正。
+
 ## 背景问题
 
 之前的 force semantic 分支使用：
@@ -162,6 +166,10 @@ uv run scripts/train.py pi0_flexiv_pump_1bottle_inputForce_lora_force_guided \
   --exp-name=flexiv_pump_lora_force_guided \
   --overwrite
 ```
+
+这条命令对应 FRA 两阶段流程的阶段一。阶段二必须加载该阶段 checkpoint，并冻结本页描述的 TCN、
+physical anchor 与 distillation 分支；完整命令见
+[`flexiv_pump_pi0_finetune.md`](flexiv_pump_pi0_finetune.md)。
 
 如果想单独调权重：
 

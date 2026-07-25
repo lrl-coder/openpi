@@ -1,10 +1,45 @@
-# Flexiv Pump：π0 微调与 CoRACE 部署
+# Flexiv Pump：force-guided π0 与 FRA 两阶段微调
 
-本文只描述当前实现。旧 Gaussian-NLL、采样能量引导和残差 token modulation 路径已经删除。
+本文给出当前 joint-space 数据格式、两阶段训练命令和 FRA 部署入口。完整算法、公式与消融见
+[`force_reflex_adapter.md`](force_reflex_adapter.md)。
+
+## 数据格式
+
+原始观测：
+
+```text
+observation/state =
+  joint_position(7), gripper_width(1), f_ext_base_frame(6)  # 14D
+```
+
+原始动作：
+
+```text
+action =
+  target_joint_position(7), target_gripper_width(1)         # 8D
+```
+
+FRA 只修正前 7 个机械臂关节；第 8 维夹爪命令始终由 π0 控制。模型内部仍把 state/action pad 到
+`action_dim=32`，输出时裁回 8D。
+
+所有 `*_force_guided` 和 `*_fra_stage2` 配置要求：
+
+```text
+force                 = state[8:14]
+force_history_global  = 64-step causal history
+force_targets         = action horizon 对齐的未来力
+```
+
+阶段二还构造：
+
+```text
+fra_joint_states  [H, 7]
+fra_force_history [H, 64, 6]
+```
+
+第 `k` 项分别是当前状态 `q_(tau+k)` 与结束于 `tau+k` 的 causal force history，供 stale-chunk 随机采样。
 
 ## 环境变量
-
-每次训练前先进入 openpi 目录并设置环境变量：
 
 ```bash
 cd /root/autodl-tmp/openpi
@@ -17,171 +52,198 @@ export HF_HOME=/root/autodl-fs/openpi_cache/hf_home
 
 ## 归一化统计
 
-训练前必须先有 norm stats。
-
-这些 stats 来自完整 13 维 state。默认 7 维配置归一化时只会取前 7 维统计量。如果想重新生成更干净的 7 维统计，或者文件不存在，运行：
-
-```bash
-uv run scripts/compute_norm_stats.py \
-  --config-name pi0_flexiv_pump_1bottle_inputForce_lora
-```
-
-如果要训练带力信息的 LoRA 配置，需要单独计算：
+先为完整 14D state 与 8D action 计算统计量：
 
 ```bash
 uv run scripts/compute_norm_stats.py \
   --config-name pi0_flexiv_pump_1bottle_inputForce_lora_with_force
 ```
 
-如果要跑全量微调配置，也需要给全量配置计算一次：
+旧 end-effector 数据生成的 13D state stats 与当前 joint-space 配置不兼容；force-guided 配置会直接拒绝
+加载它们。切换数据后必须重新运行上面的命令并确认生成的 `state.mean` 长度为 14、`actions.mean` 长度为 8。
 
-```bash
-uv run scripts/compute_norm_stats.py \
-  --config-name pi0_flexiv_pump_1bottle_inputForce
+force-guided 配置会从 `state[8:14]` 派生 force stats，并为 FRA 增加以下别名：
+
+```text
+fra_force_history           -> force stats
+fra_joint_states            -> action stats
+fra_current_joint_state     -> action stats
+fra_nominal_action          -> action stats
+fra_previous_nominal_action -> action stats
 ```
 
-带力信息的全量配置对应：
+让 `q_t` 使用 action stats 是必要的：这样 `nominal_action - q_t` 在归一化空间仍是有意义的关节误差。
 
-```bash
-uv run scripts/compute_norm_stats.py \
-  --config-name pi0_flexiv_pump_1bottle_inputForce_with_force
-```
+## 阶段一：force-guided π0
 
-## 配置选择
-
-推荐主实验：
+推荐配置：
 
 ```text
 pi0_flexiv_pump_1bottle_inputForce_lora_force_guided
 ```
 
-对照配置：
+目标：
 
 ```text
-pi0_flexiv_pump_1bottle_inputForce_lora
-pi0_flexiv_pump_1bottle_inputForce_lora_with_force
-pi0_flexiv_pump_1bottle_inputForce_lora_with_force_guided
-pi0_flexiv_pump_1bottle_inputForce
-pi0_flexiv_pump_1bottle_inputForce_with_force
-pi0_flexiv_pump_1bottle_inputForce_force_guided
-pi0_flexiv_pump_1bottle_inputForce_with_force_guided
+L_base = L_flow
+       + 0.05 * L_force_L2
+       + 0.05 * L_physical_anchor
+       + 0.01 * L_contact_distill
 ```
 
-命名含义：
-
-- `lora`：只训练 LoRA 与新增模块；
-- `with_force`：常规 state token 也接收完整 13D state；
-- `force_guided`：历史力语义 teacher、当前力 action token 和 `F_phi` 力预测头；名称为配置兼容保留，
-  当前在线执行模块称为 CoRACE。
-
-## 数据格式
-
-原始观测 state：
-
-```text
-current_eef_pose(6), gripper_width(1), f_ext_base_frame(6)
-```
-
-原始动作：
-
-```text
-target_eef_pose(6), target_gripper_width(1)
-```
-
-所有 `*_force_guided` 配置都要求原始 13D state。默认主配置只把前 7 维作为常规 state token，
-但单独提取：
-
-```text
-force                 = state[7:13]
-force_history_global  = 64-step history
-force_targets         = future force aligned to the action horizon
-```
-
-action expert 的力条件只有当前 `force` 经一个 Linear 投影；64 步全局历史只用于训练期 contact-dynamics
-teacher。详细结构见
-[`action_expert_current_force_l2.md`](action_expert_current_force_l2.md) 和
-[`contact_dynamics_token_force_anchor.md`](contact_dynamics_token_force_anchor.md)。
-
-## 当前训练目标
-
-```text
-L = L_flow
-  + 0.05 * L_force_L2
-  + 0.05 * L_physical_anchor
-  + 0.01 * L_contact_distill
-```
-
-其中 `F_phi` 直接回归：
-
-```text
-force_prediction: [batch, action_horizon, 6]
-```
-
-不再输出 `log_sigma`，不再优化 Gaussian NLL。
-
-## 训练
+训练：
 
 ```bash
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 uv run scripts/train.py \
   pi0_flexiv_pump_1bottle_inputForce_lora_force_guided \
-  --exp-name=flexiv_pump_lora_current_force_l2 \
+  --exp-name=flexiv_pump_fra_stage1 \
   --overwrite
 ```
 
-旧 force-aware checkpoint 的力头结构不同，不能直接 resume。应从 π0 base 权重启动新实验目录。
+阶段一保留：
 
-重点监控：
+- π0 flow-matching action chunk；
+- 当前瞬时力 action token；
+- Contact Dynamics TCN；
+- future-force physical summary anchor；
+- prefix query asymmetric distillation；
+- 训练期 `F_phi` L2 辅助力预测。
+
+`F_phi` 只用于阶段一辅助监督和离线诊断，不再提供在线 force residual。
+
+阶段一重点指标：
 
 ```text
 loss_fm
 loss_force_l2
-loss_force_weighted
-force_residual_mse_mean
-force_residual_rmse_mean
-force_prediction_batch_var_mean
-force_true_var_mean
 loss_force_physical_anchor
 loss_force_distill
+force_physical_summary_mse
+force_physical_summary_pred_std_mean
 force_distill_cosine_mean
 ```
 
-若 `force_prediction_batch_var_mean` 长期接近 0，而 `force_true_var_mean` 明显非 0，说明 L2 头可能退化为
-条件均值；此时先检查 action/force 时间对齐与数据方差，再调 loss weight。
+## 阶段二：冻结主模型，只训练 FRA
 
-## 固定 chunk 推理
+推荐配置：
+
+```text
+pi0_flexiv_pump_1bottle_inputForce_lora_fra_stage2
+```
+
+选定阶段一 checkpoint 的 `params` 目录：
+
+```bash
+STAGE1_PARAMS=/root/autodl-fs/openpi_checkpoints/pi0_flexiv_pump_1bottle_inputForce_lora_force_guided/flexiv_pump_fra_stage1/19999/params
+```
+
+启动全新的阶段二实验：
+
+```bash
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+uv run scripts/train.py \
+  pi0_flexiv_pump_1bottle_inputForce_lora_fra_stage2 \
+  --exp-name=flexiv_pump_fra_stage2 \
+  --weight-loader.params-path="$STAGE1_PARAMS" \
+  --overwrite
+```
+
+阶段二的实际训练步骤：
+
+1. 构建带 FRA 的同结构模型；
+2. 加载阶段一完整 checkpoint；
+3. 将阶段一不存在的 `force_reflex_adapter` 参数做零残差初始化；
+4. 冻结 π0、LoRA、action expert、Contact Dynamics Token 及所有辅助头；
+5. 由冻结 π0 对旧观测 \(o_\tau\) 生成 nominal chunk；
+6. 对每个样本随机取 `chunk_age = ell`；
+7. 用 `q_(tau+ell)`、结束于该时刻的 force history 和 nominal chunk 第 `ell` 项运行 FRA；
+8. 用同一时刻专家动作做 Huber 监督，并添加 residual magnitude 与 smoothness 正则；
+9. optimizer 只更新路径包含 `force_reflex_adapter` 的参数。
+
+阶段二默认：
+
+```text
+steps        = 10_000
+warmup       = 500
+peak LR      = 1e-4
+final LR     = 1e-5
+batch size   = 16
+EMA          = off
+```
+
+不要把阶段一目录直接 `--resume` 成阶段二。两者的模型参数树和 optimizer state 不同。
+
+阶段二监控：
+
+```text
+loss_fra_huber
+loss_fra_magnitude
+loss_fra_smoothness
+fra_chunk_age_mean
+fra_residual_abs_mean
+fra_gate_mean
+fra_corrected_action_mae
+```
+
+全量微调对应：
+
+```text
+阶段一：pi0_flexiv_pump_1bottle_inputForce_force_guided
+阶段二：pi0_flexiv_pump_1bottle_inputForce_fra_stage2
+```
+
+## 部署
+
+服务阶段二 checkpoint：
 
 ```bash
 uv run scripts/serve_policy.py policy:checkpoint \
-  --policy.config=pi0_flexiv_pump_1bottle_inputForce_lora_force_guided \
-  --policy.dir=/path/to/checkpoint
+  --policy.config=pi0_flexiv_pump_1bottle_inputForce_lora_fra_stage2 \
+  --policy.dir=/path/to/fra_stage2/checkpoint
 ```
 
-输入仍需包含原始 13D `observation/state`。
+机器人端使用：
 
-## CoRACE 闭环执行
+```python
+from openpi_client import action_chunk_broker
+from openpi_client import websocket_client_policy
 
-服务端额外返回物理单位的未来力预测：
-
-```bash
-uv run scripts/serve_policy.py policy:checkpoint \
-  --policy.config=pi0_flexiv_pump_1bottle_inputForce_lora_force_guided \
-  --policy.dir=/path/to/checkpoint \
-  --policy.return-force-prediction
+client = websocket_client_policy.WebsocketClientPolicy(host="localhost", port=8000)
+policy = action_chunk_broker.ForceReflexActionChunkBroker(
+    client,
+    action_horizon=50,
+    arm_joint_dim=7,
+    force_dim=6,
+    force_history_len=64,
+    joint_lower_limits=ARM_JOINT_LOWER_LIMITS,
+    joint_upper_limits=ARM_JOINT_UPPER_LIMITS,
+)
 ```
 
-机器人端用 `CoRACEActionChunkBroker` 包装 websocket client。每个控制步都把最新 6D force 放在 observation
-的 `force` 键中并调用 broker；broker 只在 chunk 耗尽或残差超阈值时访问服务端。
+每次 `policy.infer(observation)` 返回一个已修正并施加关节限位的 8D 动作。chunk 为空时才运行完整 π0；
+其余控制周期只运行 Contact Dynamics Encoder 与 FRA。
 
-阈值必须从独立 nominal calibration rollouts 标定，不要复用训练 loss 或手写常数。完整公式、客户端代码、
-传感器延迟设置和消融设计见
-[`contact_residual_adaptive_chunk_execution.md`](contact_residual_adaptive_chunk_execution.md)。
+输入至少包含：
+
+```python
+observation = {
+    "observation/image": base_image,
+    "observation/wrist_image": wrist_image,
+    "observation/state": np.concatenate([q_t, [gripper_width], wrench_t]),
+    "force": wrench_t,
+    "prompt": task_instruction,
+}
+```
 
 ## 最小验收
 
-1. 数据中的 action 与 future force target 逐控制步对齐；
-2. `predict_force` 输出 `[B, H, 6]` 且物理单位反归一化正确；
-3. 离线按 horizon step 报告六轴 RMSE，而不只报总平均；
-4. 固定 chunk、每步重规划、CoRACE 使用相同 checkpoint；
-5. 同时报告成功率、峰值力、query 次数、平均实际 chunk 长度和误触发率；
-6. 机器人安全限位与急停独立于 CoRACE。
+1. 原始 state 是 14D，action 是 8D，关节顺序与机器人控制器一致；
+2. action、state、force 时间戳逐控制步对齐；
+3. 阶段一 checkpoint 的 physical anchor 和 distillation 均已收敛；
+4. 阶段二日志确认只有 FRA 参数产生梯度；
+5. `fra_chunk_age_mean` 符合均匀采样，residual 不长期严格为零；
+6. reflex-only 请求不调用 π0 action sampler；
+7. 输出夹爪维与 nominal chunk 完全一致；
+8. 下发前执行厂商 joint limits，急停和力硬限位独立于 FRA；
+9. 对比 Fixed Chunk、Step-wise Replanning、旧 CoRACE baseline 和 FRA 时使用相同阶段一主策略。

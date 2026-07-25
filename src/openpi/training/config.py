@@ -46,12 +46,14 @@ class SliceObservationState(_transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class FlexivPumpInputs(_transforms.DataTransformFn):
-    """Converts the Flexiv pump LeRobot sample into pi0 inputs and exposes force labels."""
+    """Convert Flexiv joint-space samples and construct force/FRA supervision."""
 
     model_type: ModelType
     include_force_in_state: bool = False
     force_history_global_len: int = 64
     force_history_local_len: int = 16
+    arm_joint_dim: int = 7
+    fra_training: bool = False
 
     def __call__(self, data: dict) -> dict:
         raw_state = np.asarray(data["observation/state"])
@@ -65,20 +67,23 @@ class FlexivPumpInputs(_transforms.DataTransformFn):
             history_states = raw_state[None, :]
             future_states = None
 
-        if current_state.shape[-1] < 13:
+        state_dim_without_force = self.arm_joint_dim + 1
+        required_state_dim = state_dim_without_force + 6
+        if current_state.shape[-1] < required_state_dim:
             raise ValueError(
-                "Flexiv force-guided configs require raw observation/state with 13 dims: "
-                "current_eef_pose(6), gripper_width(1), f_ext_base_frame(6)."
+                f"Flexiv force-guided configs require raw observation/state with {required_state_dim} dims: "
+                f"joint_position({self.arm_joint_dim}), gripper_width(1), f_ext_base_frame(6)."
             )
 
-        state_dim = 13 if self.include_force_in_state else 7
+        state_dim = required_state_dim if self.include_force_in_state else state_dim_without_force
         model_input = dict(data)
         model_input["observation/state"] = current_state[:state_dim]
         inputs = libero_policy.LiberoInputs(model_type=self.model_type)(model_input)
 
-        current_force = current_state[7:13]
+        force_slice = slice(state_dim_without_force, required_state_dim)
+        current_force = current_state[force_slice]
         inputs["force"] = current_force
-        force_history = np.asarray(history_states[..., 7:13])
+        force_history = np.asarray(history_states[..., force_slice])
         force_history_global = _left_pad_or_trim_history(force_history, self.force_history_global_len)
         force_history_local = _left_pad_or_trim_history(force_history, self.force_history_local_len)
         inputs["force_history_global"] = force_history_global
@@ -89,7 +94,7 @@ class FlexivPumpInputs(_transforms.DataTransformFn):
         inputs["force_history"] = force_history_local
 
         if future_states is not None and "actions" in inputs:
-            force_targets = future_states[..., 7:13]
+            force_targets = future_states[..., force_slice]
             action_horizon = inputs["actions"].shape[0]
             if force_targets.shape[0] == 0:
                 force_targets = np.repeat(current_force[None, :], action_horizon, axis=0)
@@ -107,7 +112,54 @@ class FlexivPumpInputs(_transforms.DataTransformFn):
         else:
             inputs["force_task_target"] = current_force
 
+        if self.fra_training and raw_state.ndim >= 2 and "actions" in inputs:
+            action_horizon = inputs["actions"].shape[0]
+            current_sequence = raw_state[current_index : current_index + action_horizon]
+            if current_sequence.shape[0] < action_horizon:
+                current_sequence = np.concatenate(
+                    [
+                        current_sequence,
+                        np.repeat(current_sequence[-1:], action_horizon - current_sequence.shape[0], axis=0),
+                    ],
+                    axis=0,
+                )
+            inputs["fra_joint_states"] = current_sequence[..., : self.arm_joint_dim]
+
+            all_force = raw_state[..., force_slice]
+            fra_force_history = []
+            for chunk_index in range(action_horizon):
+                end = min(current_index + chunk_index + 1, all_force.shape[0])
+                start = max(0, end - self.force_history_global_len)
+                fra_force_history.append(
+                    _left_pad_or_trim_history(all_force[start:end], self.force_history_global_len)
+                )
+            inputs["fra_force_history"] = np.stack(fra_force_history, axis=0)
+
+        # Reflex-only calls use the same input transform as nominal planning.
+        # Preserve adapter inputs supplied by the execution broker.
+        for key in (
+            "fra_nominal_action",
+            "fra_previous_nominal_action",
+            "fra_current_joint_state",
+            "fra_chunk_progress",
+        ):
+            if key in data:
+                inputs[key] = np.asarray(data[key])
+        if "force_history_global" in data:
+            inputs["force_history_global"] = _left_pad_or_trim_history(
+                np.asarray(data["force_history_global"]),
+                self.force_history_global_len,
+            )
+
         return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class FlexivPumpOutputs(_transforms.DataTransformFn):
+    action_dim: int = 8
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"])[..., : self.action_dim]}
 
 
 def _left_pad_or_trim_history(history: np.ndarray, target_len: int) -> np.ndarray:
@@ -130,19 +182,22 @@ def _force_norm_stats_from_state(
 
     state_stats = norm_stats["state"]
     state_dim = np.asarray(state_stats.mean).shape[-1]
-    if state_dim < 13:
+    if state_dim < 14:
         raise ValueError(
-            "Force-guided Flexiv configs require normalization stats computed from the raw 13D state "
+            "Force-guided Flexiv configs require normalization stats computed from the raw 14D state "
             f"(got state stats with {state_dim} dims). Run `uv run scripts/compute_norm_stats.py "
             "--config-name pi0_flexiv_pump_1bottle_inputForce_lora_with_force` for LoRA, or the matching "
             "`*_with_force` full-finetune config, then point the force-guided config at those assets."
         )
+    if "actions" not in norm_stats:
+        raise ValueError("FRA requires action normalization statistics.")
     force_stats = _normalize.NormStats(
-        mean=np.asarray(state_stats.mean)[7:13],
-        std=np.asarray(state_stats.std)[7:13],
-        q01=None if state_stats.q01 is None else np.asarray(state_stats.q01)[7:13],
-        q99=None if state_stats.q99 is None else np.asarray(state_stats.q99)[7:13],
+        mean=np.asarray(state_stats.mean)[8:14],
+        std=np.asarray(state_stats.std)[8:14],
+        q01=None if state_stats.q01 is None else np.asarray(state_stats.q01)[8:14],
+        q99=None if state_stats.q99 is None else np.asarray(state_stats.q99)[8:14],
     )
+    action_stats = norm_stats["actions"]
     return {
         **norm_stats,
         "force": force_stats,
@@ -151,6 +206,13 @@ def _force_norm_stats_from_state(
         "force_history": force_stats,
         "force_targets": force_stats,
         "force_task_target": force_stats,
+        "fra_force_history": force_stats,
+        # q_t and nominal actions must share the action normalization so that
+        # nominal_action - current_joint_state is a meaningful joint-space error.
+        "fra_joint_states": action_stats,
+        "fra_current_joint_state": action_stats,
+        "fra_nominal_action": action_stats,
+        "fra_previous_nominal_action": action_stats,
     }
 
 
@@ -210,7 +272,7 @@ class DataConfig:
     action_sequence_keys: Sequence[str] = ("actions",)
     # Optional extra LeRobot keys that should be loaded as delta-timestamp sequences. Values are integer frame offsets.
     extra_delta_timestamp_steps: dict[str, Sequence[int]] = dataclasses.field(default_factory=dict)
-    # If true, derive force normalization stats from state[7:13].
+    # If true, derive Flexiv force/FRA normalization aliases from joint-space state[8:14].
     derive_force_norm_stats_from_state: bool = False
 
     # If true, will use the LeRobot dataset task to define the prompt.
@@ -595,15 +657,16 @@ def _flexiv_pump_data_config(
     *,
     include_force: bool = False,
     force_guided: bool = False,
+    fra_training: bool = False,
     assets_dir: str | None = None,
     force_history_global_len: int = 64,
     force_history_local_len: int = 16,
 ) -> SimpleDataConfig:
-    # The dataset action is [target_eef_pose(6), target_gripper_width(1)].
-    # pi0 is trained on delta actions for continuous robot motion, while gripper
-    # commands are kept absolute.
-    delta_action_mask = _transforms.make_bool_mask(6, -1)
-    state_dim = 13 if include_force else 7
+    # Joint-space dataset:
+    #   state  = [joint_position(7), gripper_width(1), wrench(6)]
+    #   action = [target_joint_position(7), target_gripper_width(1)]
+    # FRA corrects absolute arm-joint targets and leaves the gripper untouched.
+    state_dim = 14 if include_force else 8
 
     return SimpleDataConfig(
         repo_id="flexiv_pump_1bottle_inputForce",
@@ -618,15 +681,15 @@ def _flexiv_pump_data_config(
                     include_force_in_state=include_force,
                     force_history_global_len=force_history_global_len,
                     force_history_local_len=force_history_local_len,
+                    arm_joint_dim=7,
+                    fra_training=fra_training,
                 )
                 if force_guided
                 else SliceObservationState(state_dim),
                 *([] if force_guided else [libero_policy.LiberoInputs(model_type=model.model_type)]),
-                _transforms.DeltaActions(delta_action_mask),
             ],
             outputs=[
-                _transforms.AbsoluteActions(delta_action_mask),
-                libero_policy.LiberoOutputs(),
+                FlexivPumpOutputs(action_dim=8),
             ],
         ),
         base_config=DataConfig(
@@ -952,6 +1015,48 @@ _CONFIGS = [
         ema_decay=None,
     ),
     TrainConfig(
+        name="pi0_flexiv_pump_1bottle_inputForce_lora_fra_stage2",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_guidance=True,
+            force_loss_weight=0.05,
+            force_target_loss_weight=0.01,
+            force_physical_loss_weight=0.05,
+            fra_enabled=True,
+            fra_training_only=True,
+            fra_arm_dim=7,
+        ),
+        data=_flexiv_pump_data_config(
+            force_guided=True,
+            fra_training=True,
+            assets_dir="./assets/pi0_flexiv_pump_1bottle_inputForce_lora_with_force",
+        ),
+        # Override this placeholder with the final stage-one checkpoint via
+        # --weight-loader.params-path.
+        weight_loader=weight_loaders.CheckpointWeightLoader("/path/to/stage1/checkpoint/params"),
+        num_train_steps=10_000,
+        batch_size=16,
+        num_workers=0,
+        eval_split="test",
+        checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_steps=10_000,
+            decay_lr=1e-5,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_guidance=True,
+            fra_enabled=True,
+            fra_training_only=True,
+            fra_arm_dim=7,
+        ).get_fra_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
         name="pi0_flexiv_pump_1bottle_inputForce_lora_with_force_guided",
         model=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora",
@@ -1019,6 +1124,42 @@ _CONFIGS = [
         num_workers=0,
         eval_split="test",
         checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
+    ),
+    TrainConfig(
+        name="pi0_flexiv_pump_1bottle_inputForce_fra_stage2",
+        model=pi0_config.Pi0Config(
+            force_guidance=True,
+            force_loss_weight=0.05,
+            force_target_loss_weight=0.01,
+            force_physical_loss_weight=0.05,
+            fra_enabled=True,
+            fra_training_only=True,
+            fra_arm_dim=7,
+        ),
+        data=_flexiv_pump_data_config(
+            force_guided=True,
+            fra_training=True,
+            assets_dir="./assets/pi0_flexiv_pump_1bottle_inputForce_with_force",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/path/to/stage1/checkpoint/params"),
+        num_train_steps=10_000,
+        batch_size=16,
+        num_workers=0,
+        eval_split="test",
+        checkpoint_base_dir="/root/autodl-fs/openpi_checkpoints",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_steps=10_000,
+            decay_lr=1e-5,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            force_guidance=True,
+            fra_enabled=True,
+            fra_training_only=True,
+            fra_arm_dim=7,
+        ).get_fra_freeze_filter(),
+        ema_decay=None,
     ),
     TrainConfig(
         name="pi0_flexiv_pump_1bottle_inputForce_with_force_guided",

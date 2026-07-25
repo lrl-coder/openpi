@@ -43,6 +43,12 @@ _CONSOLE_LOG_KEYS = (
     "loss_force_semantic_align",
     "force_distill_cosine_mean",
     "force_semantic_cosine_mean",
+    "loss_fra_huber",
+    "loss_fra_magnitude",
+    "loss_fra_smoothness",
+    "fra_chunk_age_mean",
+    "fra_residual_abs_mean",
+    "fra_gate_mean",
     "test/loss_fm",
     "test/force_l2",
     "test/loss_force_l2",
@@ -51,6 +57,10 @@ _CONSOLE_LOG_KEYS = (
     "test/loss_force_semantic_align",
     "test/force_distill_cosine_mean",
     "test/force_semantic_cosine_mean",
+    "test/loss_fra_huber",
+    "test/loss_fra_magnitude",
+    "test/loss_fra_smoothness",
+    "test/fra_residual_abs_mean",
 )
 
 
@@ -157,18 +167,18 @@ def _log_force_prediction_trace(
     force_dim = target.shape[2]
     for sample_idx in range(sample_count):
         for time_idx in range(horizon):
-            for axis_idx in range(force_dim):
-                rows.append(
-                    [
-                        sample_idx,
-                        time_idx,
-                        axis_idx,
-                        float(target[sample_idx, time_idx, axis_idx]),
-                        float(prediction[sample_idx, time_idx, axis_idx]),
-                        float(residual[sample_idx, time_idx, axis_idx]),
-                        float(squared_error[sample_idx, time_idx, axis_idx]),
-                    ]
-                )
+            rows.extend(
+                [
+                    sample_idx,
+                    time_idx,
+                    axis_idx,
+                    float(target[sample_idx, time_idx, axis_idx]),
+                    float(prediction[sample_idx, time_idx, axis_idx]),
+                    float(residual[sample_idx, time_idx, axis_idx]),
+                    float(squared_error[sample_idx, time_idx, axis_idx]),
+                ]
+                for axis_idx in range(force_dim)
+            )
 
     columns = ["sample", "time", "axis", "target", "prediction", "residual", "squared_error"]
     csv_path = out_dir / f"step_{step:08d}.csv"
@@ -180,15 +190,15 @@ def _log_force_prediction_trace(
     feature_rows = []
     feature_dim = query_feature.shape[-1]
     for sample_idx in range(sample_count):
-        for dim_idx in range(feature_dim):
-            feature_rows.append(
-                [
-                    sample_idx,
-                    dim_idx,
-                    float(query_feature[sample_idx, dim_idx]),
-                    float(force_feature[sample_idx, dim_idx]),
-                ]
-            )
+        feature_rows.extend(
+            [
+                sample_idx,
+                dim_idx,
+                float(query_feature[sample_idx, dim_idx]),
+                float(force_feature[sample_idx, dim_idx]),
+            ]
+            for dim_idx in range(feature_dim)
+        )
 
     feature_columns = ["sample", "dim", "query_feature", "force_feature"]
     feature_csv_path = out_dir / f"step_{step:08d}_semantic_features.csv"
@@ -507,6 +517,9 @@ def main(config: _config.TrainConfig):
         out_shardings=replicated_sharding,
     )
     log_force_diagnostics = bool(getattr(config.model, "force_guidance", False))
+    log_force_prediction_trace = log_force_diagnostics and not bool(
+        getattr(config.model, "fra_training_only", False)
+    )
     csv_metric_logger = CsvMetricLogger(config.checkpoint_dir / "metrics.csv", resume=resuming)
     logging.info(f"Writing scalar metrics to: {csv_metric_logger.path}")
 
@@ -530,10 +543,11 @@ def main(config: _config.TrainConfig):
                 with sharding.set_mesh(mesh):
                     diagnostic_info = pdiagnostic_step(train_rng, train_state, batch)
                 reduced_info.update(jax.device_get(jax.tree.map(jnp.mean, diagnostic_info)))
-                with sharding.set_mesh(mesh):
-                    force_trace = pforce_prediction_trace_step(train_state, batch)
-                force_trace = jax.device_get(force_trace)
-                _log_force_prediction_trace(force_trace, step=step, checkpoint_dir=config.checkpoint_dir)
+                if log_force_prediction_trace:
+                    with sharding.set_mesh(mesh):
+                        force_trace = pforce_prediction_trace_step(train_state, batch)
+                    force_trace = jax.device_get(force_trace)
+                    _log_force_prediction_trace(force_trace, step=step, checkpoint_dir=config.checkpoint_dir)
             if eval_iter is not None:
                 eval_infos = []
                 for _ in range(config.eval_num_batches):

@@ -4,7 +4,7 @@
 
 - 分支：`action-expert-current-force-L2-loss`
 - 记录日期：2026-07-24
-- 影响范围：JAX `Pi0` 的 force-aware action expert、辅助力预测头 `F_phi`、训练诊断与 CoRACE 在线执行
+- 影响范围：JAX `Pi0` 的 force-aware action expert、训练期辅助力预测头 `F_phi` 与训练诊断
 - 不影响范围：未启用 `force_guidance` 的原始 π0、flow-matching 主损失、VLM semantic-force query、全局历史力 teacher
 
 ## 目标
@@ -131,32 +131,24 @@ force_history_global [B, 64, 6]
 ```
 
 因此，`force_history_global` 仍是训练 semantic-force teacher 所必需的输入。数据管线继续产生
-`force_history_local` / `force_history`，仅用于数据兼容和诊断，不再参与 action token 或在线残差的构造。
+`force_history_local` / `force_history`，仅用于数据兼容和诊断，不参与 FRA。
 
-## 在线执行：CoRACE
+## 在线执行：FRA
 
-旧 token 缩放路径已删除。残差不再缩放 force token，也不进入 denoising。推理期由
-**CoRACE（Contact-Residual Adaptive Chunk Execution）**把 `F_phi` 的预测作为 action chunk 的执行监测信号：
+`F_phi` 保留为阶段一训练期辅助目标和离线诊断，不再返回给机器人，也不再构造在线预测力残差。
 
-```text
-policy(o_t) -> action_chunk[0:H], force_prediction[0:H]
-execute action[k]
-observe force[k]
-compare force[k] with force_prediction[k]
-if calibrated residual is exceeded:
-    discard action[k+1:H]
-    replan from the latest observation
-```
-
-在线残差使用独立尺度消除 6 个轴的单位与量级差异：
+推理期由 [FRA](force_reflex_adapter.md) 直接复用物理锚定的全局历史力 TCN：
 
 ```text
-r_k = mean_j(((force_observed[k, j] - force_prediction[k, j]) / force_scale[j]) ** 2)
+force_history_global -> Contact Dynamics Token
+latest q_t + nominal action + chunk progress
+    -> Force Reflex Adapter
+    -> joint residual
+    -> corrected joint target
 ```
 
-`force_scale` 从训练划分的预测残差估计；阈值从独立 nominal calibration rollouts
-用 chunk 最大残差的 split-conformal 分位数得到。完整协议、公式和部署方式见
-[`contact_residual_adaptive_chunk_execution.md`](contact_residual_adaptive_chunk_execution.md)。
+因此在线路径不再需要 per-axis residual scale、conformal threshold、预测/测量索引对齐或触发式丢弃
+chunk suffix。
 
 ## 代码位置
 
@@ -167,12 +159,11 @@ r_k = mean_j(((force_observed[k, j] - force_prediction[k, j]) / force_scale[j]) 
   - `_force_l2_loss`：L2/MSE 辅助损失
   - `_force_prediction_info`：L2 诊断指标
 - `src/openpi/policies/policy.py`
-  - 可选返回与 action chunk 对齐的 `force_prediction`
-  - 不再缓存上一轮残差或改变下一轮网络前向
+  - `fra_mode=True` 时只运行 Contact Dynamics Encoder 与 FRA
+  - 正常请求仍生成 nominal action chunk
 - `packages/openpi-client/src/openpi_client/action_chunk_broker.py`
-  - `CoRACEActionChunkBroker`：逐步对齐预测力与实测力
-  - 超阈值时丢弃未执行 suffix 并从最新观测重规划
-  - 提供残差尺度估计与 split-conformal 阈值标定函数
+  - `ForceReflexActionChunkBroker`：每步更新力历史并连续修正当前关节目标
+  - 保持夹爪 nominal command，并在下发前施加机械臂关节限位
 - `scripts/train.py`
   - 保存 `prediction`、`residual`、`squared_error` trace
 - `scripts/analyze_force_metrics.py`
@@ -190,10 +181,10 @@ r_k = mean_j(((force_observed[k, j] - force_prediction[k, j]) / force_scale[j]) 
 
 ### 数据格式
 
-现有 force-guided 数据格式不需要修改。当前力仍来自原始 13D state 的：
+当前 joint-space 数据是 14D state。当前力来自：
 
 ```text
-force = observation.state[7:13]
+force = observation.state[8:14]
 ```
 
 ### 旧 force-guided checkpoint
@@ -226,52 +217,7 @@ uv run scripts/train.py \
 2. action expert force token 对 `force_history_local/global` 的变化不敏感，只随 `force` 变化；
 3. `force_predictor_out.out_features == force_dim`；
 4. 日志包含 `loss_force_l2`，不再产生 `loss_force_nll` 或 `log_sigma` 指标；
-5. `predict_force` 输出形状为 `[B, action_horizon, force_dim]`；
-6. `return_force_prediction=True` 返回物理单位的 `[action_horizon, force_dim]` 预测；
-7. CoRACE 只比较已执行动作的同索引预测，超阈值时立即重规划；
-8. baseline π0、force-aware 模型与 CoRACE 单测全部通过。
-
-## 2026-07-24 验证结果
-
-静态检查：
-
-```text
-ruff check（全部变更 Python 文件）: passed
-git diff --check: passed
-```
-
-自动测试：
-
-```text
-pytest -m "not manual" \
-  packages/openpi-client/src/openpi_client/action_chunk_broker_test.py \
-  src/openpi/models/pi0_test.py \
-  src/openpi/policies/policy_test.py \
-  src/openpi/transforms_test.py
-
-27 passed, 2 deselected
-
-pytest packages/openpi-client/src/openpi_client
-28 passed
-```
-
-实际 JAX 前向：
-
-```text
-force-guided dummy model:
-  compute_loss_info -> loss.shape = (1, 4)
-  sample_actions     -> actions.shape = (1, 4, 8)
-  predict_force     -> prediction.shape = (1, 4, 6)
-  loss_force_l2     -> finite
-  all outputs finite
-```
-
-CoRACE：
-
-```text
-strict action/force index alignment: passed
-sensor-delay alignment: passed
-residual trigger and suffix discard: passed
-split-conformal threshold calibration: passed
-physical-unit force output transform: passed
-```
+5. `predict_force` 仅作为训练/诊断 API 输出 `[B, action_horizon, force_dim]`；
+6. 在线服务不再接受 `return_force_prediction`；
+7. FRA reflex-only 请求不调用完整 action sampler；
+8. 夹爪命令不被 FRA 修改。

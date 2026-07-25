@@ -62,13 +62,13 @@ class _ForceSemanticTemporalBlock(nnx.Module):
             else None
         )
 
-    def __call__(self, x):
+    def __call__(self, x, *, deterministic: bool | None = None):
         hidden = self.conv1(x)
         hidden = nnx.relu(hidden)
-        hidden = self.dropout1(hidden)
+        hidden = self.dropout1(hidden, deterministic=deterministic)
         hidden = self.conv2(hidden)
         hidden = nnx.relu(hidden)
-        hidden = self.dropout2(hidden)
+        hidden = self.dropout2(hidden, deterministic=deterministic)
         residual = x if self.downsample is None else self.downsample(x)
         return nnx.relu(hidden + residual)
 
@@ -116,11 +116,36 @@ class _ForceSemanticTCN(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        return self.block4(x)
+    def __call__(self, x, *, deterministic: bool | None = None):
+        x = self.block1(x, deterministic=deterministic)
+        x = self.block2(x, deterministic=deterministic)
+        x = self.block3(x, deterministic=deterministic)
+        return self.block4(x, deterministic=deterministic)
+
+
+class _ForceReflexAdapter(nnx.Module):
+    """Two-layer force-conditioned residual adapter in arm-joint space."""
+
+    def __init__(self, input_dim: int, hidden_dim: int, arm_dim: int, *, rngs: nnx.Rngs):
+        self.input_proj = nnx.Linear(input_dim, hidden_dim, rngs=rngs)
+        self.hidden_proj = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
+        self.gate_head = nnx.Linear(hidden_dim, arm_dim, rngs=rngs)
+        # A zero-initialized residual head makes a newly attached FRA an exact
+        # identity correction before stage-two optimization starts.
+        self.residual_head = nnx.Linear(
+            hidden_dim,
+            arm_dim,
+            kernel_init=nnx.initializers.zeros_init(),
+            bias_init=nnx.initializers.zeros_init(),
+            rngs=rngs,
+        )
+
+    def __call__(self, inputs):
+        hidden = nnx.swish(self.input_proj(inputs))
+        hidden = nnx.swish(self.hidden_proj(hidden))
+        gate = nnx.sigmoid(self.gate_head(hidden))
+        residual_direction = nnx.tanh(self.residual_head(hidden))
+        return gate, residual_direction
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -182,6 +207,15 @@ class Pi0(_model.BaseModel):
         self.force_loss_weight = config.force_loss_weight
         self.force_target_loss_weight = config.force_target_loss_weight
         self.force_physical_loss_weight = config.force_physical_loss_weight
+        self.fra_enabled = config.fra_enabled
+        self.fra_training_only = config.fra_training_only
+        self.fra_arm_dim = config.fra_arm_dim
+        self.fra_max_chunk_age = config.fra_max_chunk_age
+        self.fra_action_scale = config.fra_action_scale
+        self.fra_loss_weight = config.fra_loss_weight
+        self.fra_magnitude_loss_weight = config.fra_magnitude_loss_weight
+        self.fra_smoothness_loss_weight = config.fra_smoothness_loss_weight
+        self.fra_huber_delta = config.fra_huber_delta
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -246,6 +280,15 @@ class Pi0(_model.BaseModel):
             # training-time semantic force teacher above.
             self.force_current_proj = nnx.Linear(config.force_dim, action_expert_config.width, rngs=rngs)
 
+            if self.fra_enabled:
+                fra_input_dim = config.force_semantic_feature_dim + 3 * config.fra_arm_dim + 1
+                self.force_reflex_adapter = _ForceReflexAdapter(
+                    fra_input_dim,
+                    config.fra_hidden_dim,
+                    config.fra_arm_dim,
+                    rngs=rngs,
+                )
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
@@ -280,7 +323,10 @@ class Pi0(_model.BaseModel):
 
     def _force_semantic_raw_feature(self, obs: _model.Observation, dtype):
         force_history = self._global_force_history_or_current(obs, dtype)
-        hidden = self.force_semantic_tcn(force_history)
+        return self._force_semantic_raw_feature_from_history(force_history)
+
+    def _force_semantic_raw_feature_from_history(self, force_history, *, deterministic: bool | None = None):
+        hidden = self.force_semantic_tcn(force_history, deterministic=deterministic)
         pooled = jnp.mean(hidden, axis=1)
         return self.force_semantic_out(pooled)
 
@@ -321,6 +367,163 @@ class Pi0(_model.BaseModel):
         cosine = jnp.sum(query_feature * teacher_feature, axis=-1)
         loss = 1.0 - cosine
         return loss, cosine, query_feature
+
+    def _force_reflex(
+        self,
+        force_history,
+        current_joint_state,
+        nominal_action,
+        previous_nominal_action,
+        chunk_progress,
+    ):
+        if not self.fra_enabled:
+            raise ValueError("Force reflex inference requires fra_enabled=True.")
+
+        # The Contact Dynamics Token is frozen during FRA training. Disable its
+        # dropout so stage two learns against the same deterministic feature used
+        # by reflex-only deployment.
+        force_raw_feature = self._force_semantic_raw_feature_from_history(force_history, deterministic=True)
+        contact_feature = self._l2_normalize(force_raw_feature)
+        nominal_arm = nominal_action[..., : self.fra_arm_dim]
+        previous_nominal_arm = previous_nominal_action[..., : self.fra_arm_dim]
+        current_joint_state = current_joint_state[..., : self.fra_arm_dim]
+        chunk_progress = jnp.reshape(chunk_progress, (chunk_progress.shape[0], 1))
+        adapter_input = jnp.concatenate(
+            [
+                contact_feature,
+                current_joint_state,
+                nominal_arm - current_joint_state,
+                nominal_arm - previous_nominal_arm,
+                chunk_progress,
+            ],
+            axis=-1,
+        )
+        gate, residual_direction = self.force_reflex_adapter(adapter_input)
+        residual = gate * self.fra_action_scale * residual_direction
+        corrected_arm = nominal_arm + residual
+        corrected_action = nominal_action.at[..., : self.fra_arm_dim].set(corrected_arm)
+        return corrected_action, residual, gate
+
+    def predict_reflex(self, observation: _model.Observation) -> dict[str, at.Array]:
+        """Correct one nominal action without evaluating the VLA action generator."""
+        if not self.fra_enabled:
+            raise ValueError("predict_reflex requires fra_enabled=True.")
+        required = {
+            "fra_nominal_action": observation.fra_nominal_action,
+            "fra_previous_nominal_action": observation.fra_previous_nominal_action,
+            "fra_current_joint_state": observation.fra_current_joint_state,
+            "fra_chunk_progress": observation.fra_chunk_progress,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ValueError(f"predict_reflex is missing observation fields: {', '.join(missing)}")
+
+        observation = _model.preprocess_observation(None, observation, train=False)
+        force_history = self._global_force_history_or_current(observation, jnp.float32)
+        corrected_action, residual, gate = self._force_reflex(
+            force_history,
+            observation.fra_current_joint_state,
+            observation.fra_nominal_action,
+            observation.fra_previous_nominal_action,
+            observation.fra_chunk_progress,
+        )
+        return {
+            "corrected_action": corrected_action.astype(jnp.float32),
+            "residual": residual.astype(jnp.float32),
+            "gate": gate.astype(jnp.float32),
+        }
+
+    @staticmethod
+    def _select_chunk_step(sequence, indices):
+        gather_shape = (indices.shape[0], 1) + (1,) * (sequence.ndim - 2)
+        gather_indices = jnp.reshape(indices, gather_shape)
+        selected = jnp.take_along_axis(sequence, gather_indices, axis=1)
+        return jnp.squeeze(selected, axis=1)
+
+    def _huber(self, residual):
+        absolute = jnp.abs(residual)
+        delta = self.fra_huber_delta
+        return jnp.where(absolute <= delta, 0.5 * jnp.square(residual), delta * (absolute - 0.5 * delta))
+
+    def _compute_fra_loss_and_info(self, rng, observation, actions, *, return_info: bool):
+        if observation.fra_joint_states is None or observation.fra_force_history is None:
+            raise ValueError(
+                "FRA stage-two training requires fra_joint_states and fra_force_history from the data transform."
+            )
+
+        plan_rng, age_rng = jax.random.split(rng)
+        # The frozen VLA supplies the nominal plan. Stop-gradient enforces the
+        # intended decomposition even if a caller misconfigures the optimizer.
+        nominal_chunk = jax.lax.stop_gradient(self.sample_actions(plan_rng, observation))
+        max_age = min(
+            self.fra_max_chunk_age,
+            self.action_horizon - 1,
+            observation.fra_joint_states.shape[1] - 1,
+            observation.fra_force_history.shape[1] - 1,
+        )
+        chunk_age = jax.random.randint(
+            age_rng,
+            (actions.shape[0],),
+            minval=0,
+            maxval=max_age + 1,
+        )
+        previous_age = jnp.maximum(chunk_age - 1, 0)
+        previous_previous_age = jnp.maximum(chunk_age - 2, 0)
+
+        nominal_action = self._select_chunk_step(nominal_chunk, chunk_age)
+        previous_nominal_action = self._select_chunk_step(nominal_chunk, previous_age)
+        current_joint_state = self._select_chunk_step(observation.fra_joint_states, chunk_age)
+        force_history = self._select_chunk_step(observation.fra_force_history, chunk_age)
+        chunk_progress = chunk_age.astype(jnp.float32)[:, None] / float(self.action_horizon)
+        corrected_action, residual, gate = self._force_reflex(
+            force_history,
+            current_joint_state,
+            nominal_action,
+            previous_nominal_action,
+            chunk_progress,
+        )
+
+        expert_action = self._select_chunk_step(actions, chunk_age)
+        action_error = corrected_action[..., : self.fra_arm_dim] - expert_action[..., : self.fra_arm_dim]
+        fra_loss = jnp.mean(self._huber(action_error), axis=-1)
+        magnitude_loss = jnp.mean(jnp.abs(residual), axis=-1)
+
+        previous_joint_state = self._select_chunk_step(observation.fra_joint_states, previous_age)
+        previous_force_history = self._select_chunk_step(observation.fra_force_history, previous_age)
+        previous_previous_nominal = self._select_chunk_step(nominal_chunk, previous_previous_age)
+        previous_progress = previous_age.astype(jnp.float32)[:, None] / float(self.action_horizon)
+        _, previous_residual, _ = self._force_reflex(
+            previous_force_history,
+            previous_joint_state,
+            previous_nominal_action,
+            previous_previous_nominal,
+            previous_progress,
+        )
+        has_previous = (chunk_age > 0).astype(jnp.float32)
+        smoothness_loss = (
+            jnp.mean(jnp.square(residual - previous_residual), axis=-1) * has_previous
+        )
+
+        total = (
+            self.fra_loss_weight * fra_loss
+            + self.fra_magnitude_loss_weight * magnitude_loss
+            + self.fra_smoothness_loss_weight * smoothness_loss
+        )
+        # The common trainer expects one loss value per action-horizon step.
+        loss = jnp.broadcast_to(total[:, None], (total.shape[0], self.action_horizon))
+        info = {}
+        if return_info:
+            info = {
+                "loss_fra_huber": jnp.mean(fra_loss),
+                "loss_fra_huber_weighted": self.fra_loss_weight * jnp.mean(fra_loss),
+                "loss_fra_magnitude": jnp.mean(magnitude_loss),
+                "loss_fra_smoothness": jnp.mean(smoothness_loss),
+                "fra_chunk_age_mean": jnp.mean(chunk_age.astype(jnp.float32)),
+                "fra_residual_abs_mean": jnp.mean(jnp.abs(residual)),
+                "fra_gate_mean": jnp.mean(gate),
+                "fra_corrected_action_mae": jnp.mean(jnp.abs(action_error)),
+            }
+        return loss, info
 
     def _embed_current_force_token(self, obs: _model.Observation, dtype):
         current_force = self._current_real_force(obs, dtype)
@@ -611,8 +814,16 @@ class Pi0(_model.BaseModel):
         train: bool = False,
         return_info: bool = False,
     ):
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        preprocess_rng, noise_rng, time_rng, fra_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+
+        if self.fra_training_only:
+            return self._compute_fra_loss_and_info(
+                fra_rng,
+                observation,
+                actions,
+                return_info=return_info,
+            )
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)

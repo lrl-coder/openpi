@@ -1,5 +1,4 @@
-import math
-from typing import Dict, Optional, Sequence, Union
+from typing import Dict, Sequence
 
 import numpy as np
 import tree
@@ -8,103 +7,13 @@ from typing_extensions import override
 from openpi_client import base_policy as _base_policy
 
 
-def normalized_force_residual(
-    observed_force: np.ndarray,
-    predicted_force: np.ndarray,
-    force_scale: np.ndarray,
-) -> np.ndarray:
-    """Compute a dimensionless, per-step force residual.
-
-    The last axis is the force axis. ``force_scale`` may contain one scale per
-    force axis or one scale per horizon step and force axis.
-    """
-    observed_force = np.asarray(observed_force, dtype=np.float64)
-    predicted_force = np.asarray(predicted_force, dtype=np.float64)
-    force_scale = np.asarray(force_scale, dtype=np.float64)
-    if observed_force.ndim == 0 or force_scale.ndim == 0:
-        raise ValueError("Force arrays must have a force axis.")
-    if observed_force.shape != predicted_force.shape:
-        raise ValueError(
-            f"Observed and predicted force must have the same shape; got "
-            f"{observed_force.shape} and {predicted_force.shape}."
-        )
-    if force_scale.shape[-1] != observed_force.shape[-1]:
-        raise ValueError(f"force_scale has {force_scale.shape[-1]} axes but force has {observed_force.shape[-1]}.")
-    if not np.all(np.isfinite(observed_force)) or not np.all(np.isfinite(predicted_force)):
-        raise ValueError("Observed and predicted force must be finite.")
-    if not np.all(np.isfinite(force_scale)) or np.any(force_scale <= 0):
-        raise ValueError("force_scale must contain finite positive values.")
-    return np.mean(np.square((observed_force - predicted_force) / force_scale), axis=-1)
-
-
-def estimate_force_scale(
-    observed_force: np.ndarray,
-    predicted_force: np.ndarray,
-    *,
-    minimum_scale: float = 1e-3,
-) -> np.ndarray:
-    """Estimate one RMS residual scale per force axis from a training split."""
-    observed_force = np.asarray(observed_force, dtype=np.float64)
-    predicted_force = np.asarray(predicted_force, dtype=np.float64)
-    if observed_force.shape != predicted_force.shape or observed_force.ndim < 2:
-        raise ValueError("Force arrays must have the same shape [..., force_dim].")
-    if minimum_scale <= 0:
-        raise ValueError("minimum_scale must be positive.")
-    residual = observed_force - predicted_force
-    if not np.all(np.isfinite(residual)):
-        raise ValueError("Force arrays must be finite.")
-    reduce_axes = tuple(range(residual.ndim - 1))
-    return np.maximum(np.sqrt(np.mean(np.square(residual), axis=reduce_axes)), minimum_scale)
-
-
-def calibrate_corace_threshold(
-    observed_force: np.ndarray,
-    predicted_force: np.ndarray,
-    force_scale: np.ndarray,
-    *,
-    alpha: float = 0.05,
-) -> float:
-    """Calibrate a chunk-level split-conformal trigger threshold.
-
-    Inputs have shape ``[num_chunks, horizon, force_dim]``. Each calibration
-    score is the maximum normalized residual within one nominal chunk, so the
-    returned threshold controls the probability of any false interruption in a
-    chunk under the usual exchangeability assumption.
-    """
-    observed_force = np.asarray(observed_force)
-    predicted_force = np.asarray(predicted_force)
-    if observed_force.shape != predicted_force.shape or observed_force.ndim != 3:
-        raise ValueError("Calibration force arrays must have shape [num_chunks, horizon, force_dim].")
-    if observed_force.shape[0] == 0:
-        raise ValueError("At least one calibration chunk is required.")
-    if not 0.0 < alpha < 1.0:
-        raise ValueError("alpha must be in (0, 1).")
-
-    step_scores = normalized_force_residual(observed_force, predicted_force, np.asarray(force_scale))
-    chunk_scores = np.max(step_scores, axis=1)
-    rank = math.ceil((chunk_scores.shape[0] + 1) * (1.0 - alpha))
-    if rank > chunk_scores.shape[0]:
-        raise ValueError(
-            f"{chunk_scores.shape[0]} calibration chunks are insufficient for alpha={alpha}; "
-            f"at least {math.ceil(1.0 / alpha) - 1} are required."
-        )
-    return float(np.sort(chunk_scores)[rank - 1])
-
-
 class ActionChunkBroker(_base_policy.BasePolicy):
-    """Wraps a policy to return action chunks one-at-a-time.
-
-    Assumes that the first dimension of all action fields is the chunk size.
-
-    A new inference call to the inner policy is only made when the current
-    list of chunks is exhausted.
-    """
+    """Wrap a policy and return one action from each generated chunk."""
 
     def __init__(self, policy: _base_policy.BasePolicy, action_horizon: int):
         self._policy = policy
         self._action_horizon = action_horizon
-        self._cur_step: int = 0
-
+        self._cur_step = 0
         self._last_results: Dict[str, np.ndarray] | None = None
 
     @override
@@ -114,17 +23,12 @@ class ActionChunkBroker(_base_policy.BasePolicy):
             self._cur_step = 0
 
         def slicer(x):
-            if isinstance(x, np.ndarray):
-                return x[self._cur_step, ...]
-            else:
-                return x
+            return x[self._cur_step, ...] if isinstance(x, np.ndarray) else x
 
         results = tree.map_structure(slicer, self._last_results)
         self._cur_step += 1
-
         if self._cur_step >= self._action_horizon:
             self._last_results = None
-
         return results
 
     @override
@@ -134,135 +38,188 @@ class ActionChunkBroker(_base_policy.BasePolicy):
         self._cur_step = 0
 
 
-class CoRACEActionChunkBroker(_base_policy.BasePolicy):
-    """Contact-Residual Adaptive Chunk Execution.
+class ForceReflexActionChunkBroker(_base_policy.BasePolicy):
+    """Execute a nominal chunk with one force-conditioned joint correction per step.
 
-    After each issued action, the broker compares the newly measured force with
-    the force predicted for that exact action index. A calibrated residual
-    violation discards the unexecuted suffix and requests a new chunk from the
-    latest observation.
+    The wrapped policy supports two request modes:
+
+    * a normal request generates a nominal VLA action chunk;
+    * ``fra_mode=True`` runs only the lightweight Force Reflex Adapter.
+
+    This keeps VLA planning at chunk rate while applying the latest force feedback
+    at control rate. The arm command is clipped to optional robot joint limits;
+    the gripper command remains exactly as generated by the nominal policy.
     """
 
     def __init__(
         self,
         policy: _base_policy.BasePolicy,
         action_horizon: int,
-        residual_threshold: float,
-        force_scale: Union[np.ndarray, Sequence[float]],
         *,
+        arm_joint_dim: int = 7,
+        force_dim: int = 6,
+        force_history_len: int = 64,
+        state_key: str = "observation/state",
         force_key: str = "force",
-        force_prediction_key: str = "force_prediction",
-        measurement_delay_steps: int = 0,
+        action_key: str = "actions",
+        joint_lower_limits: Sequence[float] | np.ndarray | None = None,
+        joint_upper_limits: Sequence[float] | np.ndarray | None = None,
     ):
         if action_horizon <= 0:
             raise ValueError("action_horizon must be positive.")
-        if not np.isfinite(residual_threshold) or residual_threshold < 0:
-            raise ValueError("residual_threshold must be finite and non-negative.")
-        if measurement_delay_steps < 0:
-            raise ValueError("measurement_delay_steps must be non-negative.")
-
-        force_scale_array = np.asarray(force_scale, dtype=np.float64)
-        if force_scale_array.ndim not in (1, 2):
-            raise ValueError("force_scale must have shape [force_dim] or [horizon, force_dim].")
-        if not np.all(np.isfinite(force_scale_array)) or np.any(force_scale_array <= 0):
-            raise ValueError("force_scale must contain finite positive values.")
-        if force_scale_array.ndim == 2 and force_scale_array.shape[0] < action_horizon:
-            raise ValueError("A horizon-dependent force_scale must cover action_horizon.")
+        if arm_joint_dim <= 0:
+            raise ValueError("arm_joint_dim must be positive.")
+        if force_dim <= 0 or force_history_len <= 0:
+            raise ValueError("force_dim and force_history_len must be positive.")
 
         self._policy = policy
-        self._action_horizon = action_horizon
-        self._residual_threshold = float(residual_threshold)
-        self._force_scale = force_scale_array
+        self._action_horizon = int(action_horizon)
+        self._arm_joint_dim = int(arm_joint_dim)
+        self._force_dim = int(force_dim)
+        self._force_history_len = int(force_history_len)
+        self._state_key = state_key
         self._force_key = force_key
-        self._force_prediction_key = force_prediction_key
-        self._measurement_delay_steps = int(measurement_delay_steps)
+        self._action_key = action_key
+        self._joint_lower_limits = self._validate_limits(joint_lower_limits, "joint_lower_limits")
+        self._joint_upper_limits = self._validate_limits(joint_upper_limits, "joint_upper_limits")
+        if (self._joint_lower_limits is None) != (self._joint_upper_limits is None):
+            raise ValueError("joint_lower_limits and joint_upper_limits must be provided together.")
+        if (
+            self._joint_lower_limits is not None
+            and self._joint_upper_limits is not None
+            and np.any(self._joint_lower_limits >= self._joint_upper_limits)
+        ):
+            raise ValueError("Every lower joint limit must be smaller than its upper limit.")
 
+        self._nominal_chunk: np.ndarray | None = None
         self._cur_step = 0
-        self._last_results: Optional[Dict] = None
-        self._replan_count = 0
+        self._plan_count = 0
+        self._force_history: np.ndarray | None = None
 
-    def _request_chunk(self, obs: Dict) -> None:
-        results = self._policy.infer(obs)
-        if "actions" not in results:
-            raise KeyError("CoRACE requires policy output key 'actions'.")
-        if self._force_prediction_key not in results:
-            raise KeyError(
-                f"CoRACE requires policy output key {self._force_prediction_key!r}; "
-                "start the policy server with return_force_prediction=True."
+    def _validate_limits(self, values, name: str):
+        if values is None:
+            return None
+        array = np.asarray(values, dtype=np.float64)
+        if array.shape != (self._arm_joint_dim,) or not np.all(np.isfinite(array)):
+            raise ValueError(f"{name} must contain {self._arm_joint_dim} finite values.")
+        return array
+
+    def _current_state(self, obs: Dict) -> np.ndarray:
+        if self._state_key not in obs:
+            raise KeyError(f"FRA requires observation key {self._state_key!r}.")
+        state = np.asarray(obs[self._state_key])
+        if state.ndim != 1 or state.shape[0] < self._arm_joint_dim:
+            raise ValueError(
+                f"Observation {self._state_key!r} must be a vector with at least "
+                f"{self._arm_joint_dim} joint values."
             )
+        return state
 
-        actions = np.asarray(results["actions"])
-        force_prediction = np.asarray(results[self._force_prediction_key])
-        if actions.ndim < 2 or actions.shape[0] < self._action_horizon:
-            raise ValueError("The returned action chunk does not cover action_horizon.")
-        if force_prediction.ndim != 2 or force_prediction.shape[0] < self._action_horizon:
-            raise ValueError("force_prediction must have shape [horizon, force_dim] and cover action_horizon.")
-        if force_prediction.shape[-1] != self._force_scale.shape[-1]:
-            raise ValueError("force_prediction and force_scale must have the same force dimension.")
+    def _current_force(self, obs: Dict, state: np.ndarray) -> np.ndarray:
+        if self._force_key in obs:
+            force = np.asarray(obs[self._force_key])
+        else:
+            force_start = self._arm_joint_dim + 1
+            force = state[force_start : force_start + self._force_dim]
+        if force.shape != (self._force_dim,) or not np.all(np.isfinite(force)):
+            raise ValueError(
+                f"FRA force must have shape ({self._force_dim},); provide {self._force_key!r} "
+                "or append wrench values after arm joints and gripper in observation/state."
+            )
+        return force
 
-        self._last_results = results
+    def _update_force_history(self, force: np.ndarray) -> None:
+        if self._force_history is None:
+            self._force_history = np.repeat(force[None, :], self._force_history_len, axis=0)
+        else:
+            self._force_history = np.concatenate([self._force_history[1:], force[None, :]], axis=0)
+
+    def _request_nominal_chunk(self, obs: Dict) -> None:
+        planning_obs = dict(obs)
+        planning_obs["force_history_global"] = self._force_history
+        results = self._policy.infer(planning_obs)
+        if self._action_key not in results:
+            raise KeyError(f"FRA requires policy output key {self._action_key!r}.")
+        actions = np.asarray(results[self._action_key])
+        if actions.ndim != 2 or actions.shape[0] < self._action_horizon:
+            raise ValueError("The nominal action chunk must have shape [horizon, action_dim].")
+        if actions.shape[1] < self._arm_joint_dim:
+            raise ValueError("The nominal action dimension is smaller than arm_joint_dim.")
+        self._nominal_chunk = actions
         self._cur_step = 0
-
-    def _aligned_residual(self, obs: Dict) -> tuple:
-        prediction_index = self._cur_step - 1 - self._measurement_delay_steps
-        if prediction_index < 0:
-            return None, None
-        if self._force_key not in obs:
-            raise KeyError(f"CoRACE requires observation key {self._force_key!r}.")
-        assert self._last_results is not None
-        observed_force = np.asarray(obs[self._force_key])
-        predicted_force = np.asarray(self._last_results[self._force_prediction_key])[prediction_index]
-        if observed_force.ndim != 1:
-            raise ValueError(f"Observation {self._force_key!r} must have shape [force_dim].")
-        force_scale = self._force_scale[prediction_index] if self._force_scale.ndim == 2 else self._force_scale
-        score = normalized_force_residual(observed_force, predicted_force, force_scale)
-        return prediction_index, float(score)
+        self._plan_count += 1
 
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
-        reset = bool(np.asarray(obs.get("reset", False)))
-        if reset:
-            self._last_results = None
+        if bool(np.asarray(obs.get("reset", False))):
+            self._nominal_chunk = None
             self._cur_step = 0
-            self._replan_count = 0
+            self._plan_count = 0
+            self._force_history = None
 
-        triggered = False
-        prediction_index = None
-        residual_score = None
-        if self._last_results is not None:
-            prediction_index, residual_score = self._aligned_residual(obs)
-            if residual_score is not None and residual_score > self._residual_threshold:
-                self._last_results = None
-                self._cur_step = 0
-                self._replan_count += 1
-                triggered = True
+        state = self._current_state(obs)
+        force = self._current_force(obs, state)
+        self._update_force_history(force)
+        if self._nominal_chunk is None:
+            self._request_nominal_chunk(obs)
 
-        if self._last_results is None:
-            self._request_chunk(obs)
-
-        assert self._last_results is not None
-        results = {
-            key: (np.asarray(value)[self._cur_step] if key == "actions" else value)
-            for key, value in self._last_results.items()
-            if key != self._force_prediction_key
+        assert self._nominal_chunk is not None
+        nominal_action = self._nominal_chunk[self._cur_step]
+        previous_index = max(self._cur_step - 1, 0)
+        previous_nominal_action = self._nominal_chunk[previous_index]
+        reflex_obs = {
+            **obs,
+            "fra_mode": True,
+            "fra_nominal_action": nominal_action,
+            "fra_previous_nominal_action": previous_nominal_action,
+            "fra_current_joint_state": state[: self._arm_joint_dim],
+            "fra_chunk_progress": np.asarray(
+                [self._cur_step / self._action_horizon],
+                dtype=np.float32,
+            ),
+            "force_history_global": self._force_history,
         }
-        results["corace"] = {
-            "triggered": triggered,
-            "residual_score": residual_score,
-            "residual_threshold": self._residual_threshold,
-            "prediction_index": prediction_index,
-            "replan_count": self._replan_count,
+        reflex_results = self._policy.infer(reflex_obs)
+        if self._action_key not in reflex_results:
+            raise KeyError(f"FRA reflex response requires output key {self._action_key!r}.")
+        corrected = np.asarray(reflex_results[self._action_key])
+        if corrected.ndim == 2 and corrected.shape[0] == 1:
+            corrected = corrected[0]
+        if corrected.shape != nominal_action.shape:
+            raise ValueError("FRA corrected action must have the same shape as the nominal action.")
+
+        if self._joint_lower_limits is not None and self._joint_upper_limits is not None:
+            corrected = corrected.copy()
+            corrected[: self._arm_joint_dim] = np.clip(
+                corrected[: self._arm_joint_dim],
+                self._joint_lower_limits,
+                self._joint_upper_limits,
+            )
+
+        result = {
+            **{key: value for key, value in reflex_results.items() if key not in {self._action_key, "fra"}},
+            self._action_key: corrected,
+            "fra": {
+                **dict(reflex_results.get("fra", {})),
+                "chunk_index": self._cur_step,
+                "chunk_progress": self._cur_step / self._action_horizon,
+                "plan_count": self._plan_count,
+                "nominal_action": nominal_action,
+                "corrected_action": corrected,
+                "residual": corrected[: self._arm_joint_dim] - nominal_action[: self._arm_joint_dim],
+            },
         }
 
         self._cur_step += 1
         if self._cur_step >= self._action_horizon:
-            self._last_results = None
+            self._nominal_chunk = None
             self._cur_step = 0
-        return results
+        return result
 
     @override
     def reset(self) -> None:
         self._policy.reset()
-        self._last_results = None
+        self._nominal_chunk = None
         self._cur_step = 0
-        self._replan_count = 0
+        self._plan_count = 0
+        self._force_history = None

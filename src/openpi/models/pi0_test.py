@@ -69,6 +69,111 @@ def test_force_guided_head_has_current_force_projection_and_point_prediction():
     assert not hasattr(model, "force_predictor_in")
 
 
+def test_force_reflex_adapter_is_small_zero_residual_module():
+    arm_dim = 7
+    hidden_dim = 256
+    adapter_input_dim = 256 + 3 * arm_dim + 1
+    adapter = _pi0._ForceReflexAdapter(  # noqa: SLF001
+        adapter_input_dim,
+        hidden_dim,
+        arm_dim,
+        rngs=nnx.Rngs(0),
+    )
+    adapter_input = jnp.ones((2, adapter_input_dim), dtype=jnp.float32)
+
+    gate, residual_direction = adapter(adapter_input)
+
+    assert gate.shape == (2, arm_dim)
+    assert residual_direction.shape == (2, arm_dim)
+    np.testing.assert_allclose(residual_direction, 0.0)
+    assert sum(parameter.size for parameter in jax.tree.leaves(nnx.state(adapter))) == 140_814
+
+
+def test_fra_freeze_filter_leaves_only_adapter_trainable():
+    config = _pi0_config.Pi0Config(
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        action_dim=8,
+        action_horizon=4,
+        max_token_len=8,
+        force_guidance=True,
+        fra_enabled=True,
+        fra_training_only=True,
+    )
+    class _ToyModel(nnx.Module):
+        def __init__(self):
+            self.force_reflex_adapter = nnx.Linear(2, 2, rngs=nnx.Rngs(0))
+            self.frozen_base = nnx.Linear(2, 2, rngs=nnx.Rngs(1))
+
+    model = _ToyModel()
+    trainable = nnx.state(
+        model,
+        nnx.All(nnx.Param, nnx.Not(config.get_fra_freeze_filter())),
+    ).flat_state()
+
+    assert len(trainable) > 0
+    assert all(path[0] == "force_reflex_adapter" for path in trainable)
+
+
+class _MinimalFraModel(_pi0.Pi0):
+    def __init__(self):
+        self.action_dim = 3
+        self.action_horizon = 4
+        self.fra_enabled = True
+        self.fra_arm_dim = 2
+        self.fra_max_chunk_age = 3
+        self.fra_action_scale = 1.0
+        self.fra_loss_weight = 1.0
+        self.fra_magnitude_loss_weight = 1e-3
+        self.fra_smoothness_loss_weight = 1e-2
+        self.fra_huber_delta = 1.0
+
+    def sample_actions(self, rng, observation, **kwargs):
+        del rng, kwargs
+        return jnp.zeros(
+            (observation.state.shape[0], self.action_horizon, self.action_dim),
+            dtype=jnp.float32,
+        )
+
+    def _force_reflex(
+        self,
+        force_history,
+        current_joint_state,
+        nominal_action,
+        previous_nominal_action,
+        chunk_progress,
+    ):
+        del force_history, current_joint_state, previous_nominal_action, chunk_progress
+        residual = jnp.zeros((nominal_action.shape[0], self.fra_arm_dim), dtype=jnp.float32)
+        gate = jnp.full_like(residual, 0.5)
+        return nominal_action, residual, gate
+
+
+def test_stale_chunk_fra_loss_uses_current_feedback_and_expert_action():
+    model = _MinimalFraModel()
+    observation = _model.Observation(
+        images={},
+        image_masks={},
+        state=jnp.zeros((2, 3), dtype=jnp.float32),
+        fra_joint_states=jnp.zeros((2, 4, 2), dtype=jnp.float32),
+        fra_force_history=jnp.ones((2, 4, 3, 1), dtype=jnp.float32),
+    )
+    expert_actions = jnp.ones((2, 4, 3), dtype=jnp.float32)
+
+    loss, info = model._compute_fra_loss_and_info(  # noqa: SLF001
+        jax.random.key(0),
+        observation,
+        expert_actions,
+        return_info=True,
+    )
+
+    assert loss.shape == (2, 4)
+    np.testing.assert_allclose(loss, 0.5)
+    np.testing.assert_allclose(info["loss_fra_huber"], 0.5)
+    np.testing.assert_allclose(info["fra_residual_abs_mean"], 0.0)
+    np.testing.assert_allclose(info["fra_corrected_action_mae"], 1.0)
+
+
 class _CurrentForceHead(_pi0.Pi0):
     """Minimal module exposing the force-head helpers without constructing SigLIP."""
 

@@ -50,6 +50,20 @@ class Pi0Config(_model.BaseModelConfig):
     # Weight for the force encoder's physical summary prediction anchor.
     force_physical_loss_weight: float = 0.0
 
+    # Force Reflex Adapter. Stage one leaves this disabled and trains the
+    # force-guided pi0 normally. Stage two enables both flags below, loads the
+    # stage-one checkpoint, and freezes every parameter except the adapter.
+    fra_enabled: bool = False
+    fra_training_only: bool = False
+    fra_arm_dim: int = 7
+    fra_hidden_dim: int = 256
+    fra_max_chunk_age: int = 49
+    fra_action_scale: float = 1.0
+    fra_loss_weight: float = 1.0
+    fra_magnitude_loss_weight: float = 1e-3
+    fra_smoothness_loss_weight: float = 1e-2
+    fra_huber_delta: float = 1.0
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -62,6 +76,20 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune",
                 "max-autotune-no-cudagraphs",
             ]
+        if self.fra_enabled and not self.force_guidance:
+            raise ValueError("fra_enabled=True requires force_guidance=True to reuse the Contact Dynamics Token.")
+        if self.fra_training_only and not self.fra_enabled:
+            raise ValueError("fra_training_only=True requires fra_enabled=True.")
+        if not 0 < self.fra_arm_dim <= self.action_dim:
+            raise ValueError("fra_arm_dim must be in [1, action_dim].")
+        if self.fra_hidden_dim <= 0:
+            raise ValueError("fra_hidden_dim must be positive.")
+        if self.fra_max_chunk_age < 0:
+            raise ValueError("fra_max_chunk_age must be non-negative.")
+        if self.fra_action_scale <= 0:
+            raise ValueError("fra_action_scale must be positive.")
+        if self.fra_huber_delta <= 0:
+            raise ValueError("fra_huber_delta must be positive.")
 
     @property
     @override
@@ -118,6 +146,44 @@ class Pi0Config(_model.BaseModelConfig):
                 force_task_target=(
                     jax.ShapeDtypeStruct([batch_size, self.force_dim], jnp.float32) if self.force_guidance else None
                 ),
+                fra_joint_states=(
+                    jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.fra_arm_dim], jnp.float32)
+                    if self.fra_training_only
+                    else None
+                ),
+                fra_force_history=(
+                    jax.ShapeDtypeStruct(
+                        [
+                            batch_size,
+                            self.action_horizon,
+                            self.force_history_global_len,
+                            self.force_dim,
+                        ],
+                        jnp.float32,
+                    )
+                    if self.fra_training_only
+                    else None
+                ),
+                fra_nominal_action=(
+                    jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32)
+                    if self.fra_enabled and not self.fra_training_only
+                    else None
+                ),
+                fra_previous_nominal_action=(
+                    jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32)
+                    if self.fra_enabled and not self.fra_training_only
+                    else None
+                ),
+                fra_current_joint_state=(
+                    jax.ShapeDtypeStruct([batch_size, self.fra_arm_dim], jnp.float32)
+                    if self.fra_enabled and not self.fra_training_only
+                    else None
+                ),
+                fra_chunk_progress=(
+                    jax.ShapeDtypeStruct([batch_size, 1], jnp.float32)
+                    if self.fra_enabled and not self.fra_training_only
+                    else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
@@ -153,3 +219,9 @@ class Pi0Config(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+    def get_fra_freeze_filter(self) -> nnx.filterlib.Filter:
+        """Freeze the complete VLA and Contact Dynamics Token, leaving only FRA trainable."""
+        if not self.fra_enabled:
+            raise ValueError("get_fra_freeze_filter requires fra_enabled=True.")
+        return nnx.Not(nnx_utils.PathRegex(".*force_reflex_adapter.*"))

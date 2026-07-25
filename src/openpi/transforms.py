@@ -336,6 +336,9 @@ class PadStatesAndActions(DataTransformFn):
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        for key in ("fra_nominal_action", "fra_previous_nominal_action"):
+            if key in data:
+                data[key] = pad_to_dim(data[key], self.model_action_dim, axis=-1)
         return data
 
 

@@ -28,8 +28,6 @@ class Checkpoint:
     config: str
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
-    # Return a force prediction aligned with each action for a CoRACE execution client.
-    return_force_prediction: bool = False
 
 
 @dataclasses.dataclass
@@ -95,7 +93,6 @@ def create_policy(args: Args) -> _policy.Policy:
                 _config.get_config(args.policy.config),
                 args.policy.dir,
                 default_prompt=args.default_prompt,
-                sample_kwargs={"return_force_prediction": args.policy.return_force_prediction},
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

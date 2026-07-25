@@ -68,8 +68,8 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
-        self._return_force_prediction = bool(self._sample_kwargs.pop("return_force_prediction", False))
         self._force_model_enabled = bool(getattr(model, "force_guidance", False))
+        self._fra_enabled = bool(getattr(model, "fra_enabled", False))
         self._force_history_global = None
         self._force_history_local = None
         model_config = getattr(model, "config", None)
@@ -79,26 +79,25 @@ class Policy(BasePolicy):
             self._force_history_global_len = int(model.force_history_global_len)
         if hasattr(model, "force_history_local_len"):
             self._force_history_local_len = int(model.force_history_local_len)
-        if self._return_force_prediction and (self._is_pytorch_model or not self._force_model_enabled):
-            raise ValueError("return_force_prediction=True requires a JAX force-aware model with force_guidance=True.")
-
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
-            self._predict_force = None
+            self._predict_reflex = None
         else:
             # JAX model setup
+            model.eval()
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
-            self._predict_force = (
-                nnx_utils.module_jit(model.predict_force)
-                if self._return_force_prediction and hasattr(model, "predict_force")
+            self._predict_reflex = (
+                nnx_utils.module_jit(model.predict_reflex)
+                if self._fra_enabled and hasattr(model, "predict_reflex")
                 else None
             )
             self._rng = rng or jax.random.key(0)
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        reflex_mode = bool(np.asarray(obs.get("fra_mode", False)))
         if bool(np.asarray(obs.get("reset", False))):
             self._force_history_global = None
             self._force_history_local = None
@@ -154,20 +153,38 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
-        outputs = {
-            "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
-        }
-        if self._return_force_prediction and self._predict_force is not None:
-            force_prediction = self._predict_force(observation, outputs["actions"])
-            outputs["force_prediction"] = force_prediction
+        if reflex_mode:
+            if self._predict_reflex is None:
+                raise ValueError("fra_mode=True requires a JAX checkpoint trained with fra_enabled=True.")
+            reflex_outputs = self._predict_reflex(observation)
+            outputs = {
+                "state": inputs["state"],
+                "actions": reflex_outputs["corrected_action"][:, None, :],
+                "fra_gate": reflex_outputs["gate"],
+            }
+        else:
+            outputs = {
+                "state": inputs["state"],
+                "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
+        reflex_gate = np.asarray(outputs.pop("fra_gate")) if reflex_mode else None
         outputs = self._output_transform(outputs)
+        if reflex_mode:
+            nominal_action = np.asarray(obs["fra_nominal_action"])
+            corrected_action = np.asarray(outputs["actions"])[0]
+            assert reflex_gate is not None
+            gate = reflex_gate
+            arm_dim = int(getattr(self._model, "fra_arm_dim", gate.shape[-1]))
+            outputs["fra"] = {
+                "residual": corrected_action[:arm_dim] - nominal_action[:arm_dim],
+                "gate": gate[:arm_dim],
+            }
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

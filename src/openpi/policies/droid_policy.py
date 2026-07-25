@@ -78,7 +78,4 @@ class DroidInputs(transforms.DataTransformFn):
 class DroidOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # Only return the first 8 dims.
-        outputs = {"actions": np.asarray(data["actions"][:, :8])}
-        if "force_prediction" in data:
-            outputs["force_prediction"] = np.asarray(data["force_prediction"])
-        return outputs
+        return {"actions": np.asarray(data["actions"][:, :8])}
