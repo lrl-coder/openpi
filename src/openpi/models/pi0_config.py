@@ -44,6 +44,9 @@ class Pi0Config(_model.BaseModelConfig):
     force_history_local_len: int = 16
     force_global_patch_size: int = 8
     force_semantic_feature_dim: int = 256
+    # Width of the lightweight two-layer MLP that predicts absolute future
+    # force from the concatenated action hidden state and clean-action estimate.
+    force_predictor_hidden_dim: int = 256
     force_loss_weight: float = 0.0
     # Weight for contact-dynamics distillation.
     force_target_loss_weight: float = 0.0
@@ -78,6 +81,8 @@ class Pi0Config(_model.BaseModelConfig):
             ]
         if self.fra_enabled and not self.force_guidance:
             raise ValueError("fra_enabled=True requires force_guidance=True to reuse the Contact Dynamics Token.")
+        if self.force_predictor_hidden_dim <= 0:
+            raise ValueError("force_predictor_hidden_dim must be positive.")
         if self.fra_training_only and not self.fra_enabled:
             raise ValueError("fra_training_only=True requires fra_enabled=True.")
         if not 0 < self.fra_arm_dim <= self.action_dim:

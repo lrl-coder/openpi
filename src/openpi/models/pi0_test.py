@@ -50,7 +50,7 @@ def test_pi0_all_lora():
     assert all("llm" in p for p in state)
 
 
-def test_force_guided_head_has_current_force_projection_and_point_prediction():
+def test_force_guided_head_has_current_force_projection_and_concat_mlp_prediction():
     config = _pi0_config.Pi0Config(
         paligemma_variant="dummy",
         action_expert_variant="dummy",
@@ -63,7 +63,10 @@ def test_force_guided_head_has_current_force_projection_and_point_prediction():
 
     assert model.force_current_proj.in_features == config.force_dim
     assert model.force_current_proj.out_features == 64
-    assert model.force_predictor_out.in_features == 64
+    assert model.force_predictor_hidden_norm.num_features == 64
+    assert model.force_predictor_fusion_in.in_features == 64 + config.action_dim
+    assert model.force_predictor_fusion_in.out_features == config.force_predictor_hidden_dim
+    assert model.force_predictor_out.in_features == config.force_predictor_hidden_dim
     assert model.force_predictor_out.out_features == config.force_dim
     assert not hasattr(model, "force_local_conv1")
     assert not hasattr(model, "force_predictor_in")
@@ -100,6 +103,7 @@ def test_fra_freeze_filter_leaves_only_adapter_trainable():
         fra_enabled=True,
         fra_training_only=True,
     )
+
     class _ToyModel(nnx.Module):
         def __init__(self):
             self.force_reflex_adapter = nnx.Linear(2, 2, rngs=nnx.Rngs(0))
@@ -180,8 +184,9 @@ class _CurrentForceHead(_pi0.Pi0):
     def __init__(self):
         self.force_dim = 6
         self.force_current_proj = nnx.Linear(6, 8, rngs=nnx.Rngs(0))
-        self.action_in_proj = nnx.Linear(7, 8, rngs=nnx.Rngs(1))
-        self.force_predictor_out = nnx.Linear(8, 6, rngs=nnx.Rngs(2))
+        self.force_predictor_hidden_norm = nnx.LayerNorm(8, rngs=nnx.Rngs(1))
+        self.force_predictor_fusion_in = nnx.Linear(8 + 7, 16, rngs=nnx.Rngs(2))
+        self.force_predictor_out = nnx.Linear(16, 6, rngs=nnx.Rngs(3))
 
 
 def test_current_force_token_ignores_force_history():

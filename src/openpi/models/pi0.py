@@ -249,7 +249,17 @@ class Pi0(_model.BaseModel):
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
         if self.force_guidance:
-            self.force_predictor_out = nnx.Linear(action_expert_config.width, config.force_dim, rngs=rngs)
+            self.force_predictor_hidden_norm = nnx.LayerNorm(action_expert_config.width, rngs=rngs)
+            self.force_predictor_fusion_in = nnx.Linear(
+                action_expert_config.width + config.action_dim,
+                config.force_predictor_hidden_dim,
+                rngs=rngs,
+            )
+            self.force_predictor_out = nnx.Linear(
+                config.force_predictor_hidden_dim,
+                config.force_dim,
+                rngs=rngs,
+            )
 
             self.force_semantic_query = nnx.Param(
                 0.02 * jax.random.normal(rngs.params(), (1, paligemma_config.width), dtype=jnp.float32)
@@ -500,9 +510,7 @@ class Pi0(_model.BaseModel):
             previous_progress,
         )
         has_previous = (chunk_age > 0).astype(jnp.float32)
-        smoothness_loss = (
-            jnp.mean(jnp.square(residual - previous_residual), axis=-1) * has_previous
-        )
+        smoothness_loss = jnp.mean(jnp.square(residual - previous_residual), axis=-1) * has_previous
 
         total = (
             self.fra_loss_weight * fra_loss
@@ -532,11 +540,17 @@ class Pi0(_model.BaseModel):
         force_token = self.force_current_proj(current_force)
         return force_token[:, None, :]
 
-    def _decode_force_from_action_features(self, action_features, action_hat_0=None):
-        if action_hat_0 is not None:
-            action_hat_tokens = self.action_in_proj(action_hat_0.astype(action_features.dtype))
-            action_features = action_features + action_hat_tokens
-        return self.force_predictor_out(action_features).astype(jnp.float32)
+    def _decode_force_from_action_features(self, action_features, action_hat_0):
+        normalized_features = self.force_predictor_hidden_norm(action_features)
+        fusion_features = jnp.concatenate(
+            [normalized_features, action_hat_0.astype(normalized_features.dtype)],
+            axis=-1,
+        )
+        hidden = self.force_predictor_fusion_in(fusion_features)
+        hidden = nnx.swish(hidden)
+        # This is a direct absolute-force readout: current force is not added as
+        # a persistence baseline and the target is not converted to a delta.
+        return self.force_predictor_out(hidden).astype(jnp.float32)
 
     def _action_features_from_prefix_cache(
         self,
